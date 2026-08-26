@@ -1371,9 +1371,13 @@ async function launchSubagent(
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
   }
-  if (agentDefs?.autoExit) {
-    envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
-  }
+  // The subagent tool is fire-and-forget: the subagent completes its task and
+  // exits, delivering its result back to the orchestrator. Always force
+  // auto-exit here — the agent definition's auto-exit setting only applies to
+  // interactive /subagent command spawns where the user drives the pane.
+  // Without this, agents without auto-exit (e.g. worker) never call
+  // ctx.shutdown() and linger forever after finishing their work.
+  envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
