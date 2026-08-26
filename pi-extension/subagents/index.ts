@@ -45,6 +45,7 @@ import {
 import {
   type StatusSnapshot,
   type SubagentStatusState,
+  SNAPSHOT_STALLED_AFTER_MS,
   advanceStatusState,
   capStatusLines,
   classifyStatus,
@@ -250,7 +251,10 @@ function getBundledAgentsDir(): string {
 }
 
 function getFrontmatterValue(frontmatter: string, key: string): string | undefined {
-  const match = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
+  // Use [ \t]* (horizontal whitespace only) — \s* would match newlines and
+  // accidentally capture the first item of a YAML list block as the value,
+  // e.g. `tools:\n  - bash` would parse as tools="- bash".
+  const match = frontmatter.match(new RegExp(`^${key}:[ \\t]*(.+)$`, "m"));
   return match ? match[1].trim() : undefined;
 }
 
@@ -1526,11 +1530,14 @@ function deliverPendingQuestion(running: RunningSubagent): void {
   );
 }
 
+const STALL_KILL_AFTER_MS = 5 * 60 * 1000; // 5 minutes
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
+  let stallStartMs: number | null = null;
 
   try {
     const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
@@ -1540,6 +1547,27 @@ async function watchSubagent(
       onTick() {
         observeRunningSubagent(running);
         deliverPendingQuestion(running);
+
+        // Auto-kill stalled subagents: if the activity file is missing/invalid
+        // or the subagent has been inactive for STALL_KILL_AFTER_MS, abort the
+        // poller so the catch block closes the pane and cleans up.
+        const now = Date.now();
+        const st = running.statusState;
+        const isStalled =
+          (st.snapshotState !== "present" && st.snapshotProblemSinceMs != null) ||
+          (st.snapshotState === "present" && st.lastActivityAtMs != null && now - st.lastActivityAtMs > SNAPSHOT_STALLED_AFTER_MS && !st.activeNow);
+
+        if (isStalled) {
+          const refMs = st.snapshotState !== "present"
+            ? st.snapshotProblemSinceMs!
+            : st.lastActivityAtMs!;
+          if (stallStartMs == null) stallStartMs = now;
+          if (now - Math.max(refMs, stallStartMs) >= STALL_KILL_AFTER_MS) {
+            signal.abort();
+          }
+        } else {
+          stallStartMs = null;
+        }
       },
     });
 
