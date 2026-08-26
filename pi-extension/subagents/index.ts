@@ -24,6 +24,7 @@ import {
   closeSurface,
   shellEscape,
   readScreen,
+  paneExists,
 } from "./tmux.ts";
 
 import {
@@ -2315,6 +2316,79 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             launchScriptFile,
             status: "started",
           },
+        };
+      },
+    });
+
+  // ── subagent_stop tool ──
+  pi.registerTool({
+      name: "subagent_stop",
+      label: "Stop Subagent",
+      description:
+        "Stop a running subagent by name. Kills its tmux pane, aborts its poller, " +
+        "and removes it from the running list. The subagent's session file is preserved " +
+        "so it can be resumed later via subagent_message. " +
+        "Use this to clean up subagents that are stuck, no longer needed, or have finished " +
+        "but whose completion was not detected.",
+      promptSnippet:
+        "Stop a running subagent by name. Kills its pane and cleans up tracking state.",
+      parameters: Type.Object({
+        name: Type.String({
+          description: "Exact display name of the subagent to stop.",
+        }),
+      }),
+
+      renderCall(args: any, theme: any) {
+        const target = args.name ?? "(unknown)";
+        return new Text(
+          "✗ " + theme.fg("toolTitle", theme.bold(target)) + theme.fg("dim", " — stop"),
+          0,
+          0,
+        );
+      },
+
+      renderResult(result: any, _opts: any, theme: any) {
+        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        return new Text(theme.fg("dim", text), 0, 0);
+      },
+
+      async execute(_toolCallId: string, params: any) {
+        const requestedName = params.name?.trim();
+        if (!requestedName) {
+          const err = "Provide the subagent's `name` to stop.";
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
+        const running = Array.from(runningSubagents.values()).find((r) => r.name === requestedName);
+        if (!running) {
+          const names = Array.from(runningSubagents.values()).map((r) => r.name);
+          const hint = names.length > 0 ? ` Running: ${names.join(", ")}.` : " No subagents are currently running.";
+          return {
+            content: [{ type: "text" as const, text: `No running subagent named "${requestedName}".${hint}` }],
+            details: { error: "not found" },
+          };
+        }
+
+        // Abort the poller so watchSubagent resolves and cleans up.
+        running.abortController?.abort();
+
+        // Kill the tmux pane.
+        try {
+          closeSurface(running.surface);
+        } catch {
+          // Pane may already be gone.
+        }
+
+        // Remove from running map immediately so the widget updates.
+        runningSubagents.delete(running.id);
+        updateWidget();
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Subagent "${requestedName}" stopped. Its session is preserved and can be resumed via subagent_message.`,
+          }],
+          details: { name: requestedName, status: "stopped" },
         };
       },
     });

@@ -234,8 +234,24 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
  */
 export function closeSurface(surface: string): void {
   requireTmux();
-  execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
+  try {
+    execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
+  } catch {
+    // Pane may already be gone — not an error.
+  }
   rebalanceSurfaces();
+}
+
+/**
+ * Check whether a tmux pane still exists.
+ */
+export function paneExists(surface: string): boolean {
+  try {
+    execFileSync("tmux", ["display-message", "-p", "#{pane_id}", "-t", surface], { encoding: "utf8", stdio: "pipe" });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ── Exit polling ──
@@ -322,17 +338,23 @@ export async function pollForExit(
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
       }
     } catch {
-      // Surface may have been destroyed — check if .exit file appeared in the meantime
-      if (options.sessionFile) {
-        try {
-          const exitFile = `${options.sessionFile}.exit`;
-          if (existsSync(exitFile)) {
-            const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-            rmSync(exitFile, { force: true });
-            return interpretExitSidecar(data);
-          }
-        } catch {}
+      // Surface may have been destroyed — check if the pane is truly gone.
+      // If it is, the subagent was killed externally; treat as completion.
+      if (!paneExists(surface)) {
+        // Check for .exit sidecar one last time before giving up.
+        if (options.sessionFile) {
+          try {
+            const exitFile = `${options.sessionFile}.exit`;
+            if (existsSync(exitFile)) {
+              const data = JSON.parse(readFileSync(exitFile, "utf-8"));
+              rmSync(exitFile, { force: true });
+              return interpretExitSidecar(data);
+            }
+          } catch {}
+        }
+        return { reason: "done", exitCode: 0 };
       }
+      // Pane exists but readScreen failed transiently — keep polling.
     }
 
     const elapsed = Math.floor((Date.now() - start) / 1000);
