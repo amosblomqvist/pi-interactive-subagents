@@ -1,12 +1,14 @@
 # pi-interactive-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
+Async subagents for [pi](https://github.com/badlogic/pi-mono). Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
-**tmux-only fork.** See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
+Children run either in **tmux panes** (the historical backend) or as **headless `pi --mode rpc` processes** — no multiplexer required. The backend picks itself: tmux when a server is available, headless RPC when it isn't. See [Surfaces](#surfaces).
+
+**Fork of a tmux-only fork.** See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own tmux pane — a right split off the parent pi pane, so pane creation never steals keyboard focus. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns immediately. With tmux, the sub-agent runs in its own pane — a right split off the parent pi pane, so pane creation never steals keyboard focus. Without tmux (or with the backend forced to `rpc`), the sub-agent is spawned headless over pi's JSONL RPC mode and its transcript is tracked in-process. A live widget above the input tracks every running sub-agent either way, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -17,7 +19,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). The layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
+On the tmux backend, panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). The layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
 
 If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
 
@@ -29,7 +31,7 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 
 | Tool | Description |
 | --- | --- |
-| `subagent` | Spawn a sub-agent in a dedicated tmux pane (async) |
+| `subagent` | Spawn a sub-agent on a dedicated surface (async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
@@ -59,7 +61,7 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 subagent_message({ name: "scout", message: "Also check the auth middleware" });
 ```
 
-- **Running** — the message is typed into the live pane (newlines flattened) and picked up at the next turn boundary. The call returns immediately; the eventual completion still arrives as a steer message.
+- **Running** — the message is typed into the live pane (newlines flattened) and picked up at the next turn boundary; headless children receive it verbatim as their next prompt once the current run finishes. The call returns immediately; the eventual completion still arrives as a steer message. If the child exited in between, the tool fails with an error instead of silently dropping the message.
 - **Finished** — the session is resumed with the message as the follow-up task, like a fresh spawn: fire-and-forget, always autonomous, result steered back later. The resumed run reclaims its original name.
 
 Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.
@@ -175,14 +177,46 @@ Status display is configured via `config.json` in the extension directory (copy 
 }
 ```
 
+## Surfaces
+
+A *surface* is where a sub-agent child lives. Two backends implement the same five primitives (create, send, read, close, poll-for-exit):
+
+- **tmux** — the historical backend. Children run in panes of a `pi` window; you can attach and watch them live.
+- **rpc** — headless children via `pi --mode rpc`, spawned directly by the extension (JSONL over stdio, no shell, no multiplexer). Their transcripts are tracked in-process and shown in the [panes dashboard](#panes-dashboard).
+
+Selection order: env `PI_SUBAGENT_SURFACE` > `config.json` > `auto`. The default, `auto`, keeps tmux panes when a tmux server is reachable and falls back to headless RPC children otherwise — so the extension works with zero setup outside tmux, and inside tmux nothing changes. Claude-CLI agents always use tmux (the `claude` CLI has no RPC mode).
+
+```json
+{
+  "surface": {
+    "backend": "auto",
+    "panes": { "enabled": true }
+  }
+}
+```
+
+Env overrides for one-off runs: `PI_SUBAGENT_SURFACE=rpc|tmux|auto` and `PI_SUBAGENT_PANES=0|1`.
+
+Exit detection is identical in kind on both backends: the child-side `subagent-done` extension writes a `.exit` sidecar on error stops and shuts down on completion; the tmux backend additionally screen-scrapes a sentinel, the RPC backend additionally watches the child process exit. On pi < 0.80.4, auto-exit RPC children are nudged with a cheap informational command after their final run (that pi version only consumes the child's shutdown flag on the next handled command); pi ≥ 0.80.4 emits `agent_settled` and exits on its own. pi ≥ 0.65 is required either way.
+
+Every launch is written to an artifact next to the session file for debugging: `<name>-<id>.sh` (the exact shell command typed into the pane) or `<name>-<id>.rpc.json` (argv, env, cwd, and prompts for the headless spawn).
+
+## Panes dashboard
+
+`Ctrl+Alt+P` toggles an in-pi overlay with live transcripts of every running sub-agent — both backends. It is non-capturing: while visible but unfocused, it never steals a keystroke from pi's editor. Focus it (the shortcut does that on open) and you can navigate panes with `tab`/`shift+tab`, open a composer with `enter`, and steer a sub-agent directly — the same code path the LLM's `subagent_message` uses. A failed steer (e.g. the child exited) keeps the composer open and shows the reason in the footer. `q` hides the dashboard; `escape` releases the keyboard back to pi while keeping it visible.
+
 ## Requirements
 
-- [pi](https://github.com/badlogic/pi-mono)
-- [tmux](https://github.com/tmux/tmux)
+- [pi](https://github.com/badlogic/pi-mono) ≥ 0.65 (≥ 0.80.4 recommended for headless children)
+- [tmux](https://github.com/tmux/tmux) — *optional*. Only needed if you want children in observable panes or use Claude-CLI agents.
+
+With tmux:
 
 ```bash
 tmux new -A -s pi 'pi'
 ```
+
+Without tmux, just run `pi` — children spawn headless.
 
 ## Acknowledgements
 

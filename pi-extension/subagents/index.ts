@@ -18,13 +18,35 @@ import {
   isMuxAvailable,
   muxSetupHint,
   createSurface,
-  sendCommand,
   sendLongCommand,
-  pollForExit,
-  closeSurface,
   shellEscape,
   readScreen,
 } from "./tmux.ts";
+import {
+  type ChildLaunchSpec,
+  type SurfaceConfig,
+  closeSurfaceAny,
+  isRpcSurface,
+  loadSurfaceConfig,
+  pollSurfaceForExit,
+  readSurfaceScreen,
+  resolveSurfaceBackend,
+  sendSurfaceCommand,
+} from "./surface.ts";
+import {
+  buildRpcPrompts,
+  createRpcSurface,
+  closeAllRpcSurfaces,
+  expandFileRefForRpc,
+  readRpcTranscript,
+  registerToolExtensionResolver,
+} from "./rpc.ts";
+import {
+  type PanesEntry,
+  initPanesDashboard,
+  notifyPanesChanged,
+  togglePanesDashboard,
+} from "./panes.ts";
 
 import {
   countSessionEntryLines,
@@ -231,6 +253,11 @@ function getToolExtensionPath(tool: string): string | undefined {
   if (builtin && existsSync(builtin)) return builtin;
   return EXTRA_TOOL_EXTENSIONS.get(tool);
 }
+
+// rpc.ts cannot import this module (index imports rpc), so it resolves
+// tool→extension paths through a resolver registered here at load time —
+// same process-global pattern as __pi_interactive_subagents above.
+registerToolExtensionResolver(getToolExtensionPath);
 
 /**
  * When this process was spawned as a restricted subagent, the parent pins the
@@ -503,12 +530,27 @@ function getShellReadyDelayMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
 }
 
+/**
+ * Resolve the backend for a named agent, exactly as launchSubagent will —
+ * gates and launch must agree, or a spawn the gate let through dies mid-
+ * launch with an unexplained throw (claude agents always resolve to tmux).
+ */
+function agentSurfaceBackend(agentName?: string) {
+  const cli = agentName ? loadAgentDefaults(agentName)?.cli : undefined;
+  return resolveSurfaceBackend(cli === "claude" ? "claude" : "pi");
+}
+
 function muxUnavailableResult() {
   return {
     content: [
       {
         type: "text" as const,
-        text: `Subagents require tmux. ${muxSetupHint()}`,
+        text:
+          `Subagents require tmux here: the surface backend resolved to "tmux" ` +
+          `(config.json "surface.backend" or PI_SUBAGENT_SURFACE). ` +
+          `To run subagents headless without a multiplexer, set ` +
+          `"surface": { "backend": "rpc" } in config.json, or export PI_SUBAGENT_SURFACE=rpc. ` +
+          `Note: Claude-CLI agents always need tmux.`,
       },
     ],
     details: { error: "tmux not available" },
@@ -526,6 +568,11 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
 }
 
 const statusConfig = loadStatusConfig();
+// Surface config is read live (not snapshotted) so the backend and panes keys
+// of the same config.json apply with the same change semantics mid-session.
+function surfaceConfig(): SurfaceConfig {
+  return loadSurfaceConfig();
+}
 
 function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
   if (snapshot.kind === "starting") return " starting… ";
@@ -756,6 +803,7 @@ function updateWidget() {
       widgetInterval = null;
       (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
     }
+    notifyPanesChanged();
     return;
   }
 
@@ -771,6 +819,67 @@ function updateWidget() {
     },
     { placement: "aboveEditor" },
   );
+  // Refresh pane transcripts here, on the widget's own 1s cadence, so the
+  // dashboard's render() reads a warm cache rather than spawning capture-pane
+  // subprocesses inside tui's render loop (tmux children only; rpc children
+  // keep their transcript in-process and are free to read).
+  for (const running of runningSubagents.values()) {
+    if (!isRpcSurface(running.surface)) panesTranscriptFor(running);
+  }
+  notifyPanesChanged();
+}
+
+// ── Panes dashboard data ────────────────────────────────────────────────────
+
+/**
+ * Cached pane transcripts for tmux children — capture-pane is a sync
+ * subprocess call, so the dashboard reads through a short-lived cache that
+ * the widget's 1s refresh cadence keeps warm. RPC children read their
+ * in-process transcript buffer directly (free).
+ */
+const panesTranscriptCache = new Map<string, { at: number; lines: string[] }>();
+const PANES_TRANSCRIPT_TTL_MS = 1000;
+
+function panesTranscriptFor(running: RunningSubagent): string[] {
+  if (isRpcSurface(running.surface)) {
+    return readRpcTranscript(running.surface, 6);
+  }
+  const cached = panesTranscriptCache.get(running.surface);
+  if (cached && Date.now() - cached.at < PANES_TRANSCRIPT_TTL_MS) {
+    return cached.lines;
+  }
+  let lines: string[] = [];
+  try {
+    lines = readSurfaceScreen(running.surface, 30)
+      .split("\n")
+      .map((line) => line.replace(/\s+$/, ""))
+      .filter((line) => line !== "" && !/__SUBAGENT_DONE_\d+__/.test(line))
+      .slice(-6);
+  } catch {
+    lines = [];
+  }
+  panesTranscriptCache.set(running.surface, { at: Date.now(), lines });
+  return lines;
+}
+
+/** Snapshot of running subagents for the panes dashboard overlay. */
+function buildPanesEntries(): PanesEntry[] {
+  return Array.from(runningSubagents.values()).map((running) => {
+    const snapshot = classifyStatus(running.statusState, Date.now());
+    const status = statusConfig.enabled
+      ? formatWidgetRightLabel(snapshot).trim()
+      : running.cli === "claude"
+        ? "running…"
+        : "starting…";
+    return {
+      id: running.id,
+      name: running.name,
+      agent: running.agent ?? null,
+      status,
+      transcript: panesTranscriptFor(running),
+      headless: isRpcSurface(running.surface),
+    };
+  });
 }
 
 /**
@@ -895,6 +1004,85 @@ function buildPiPromptArgs(params: {
   ];
 }
 
+// ── Launch spec renderers ──────────────────────────────────────────────────
+// index.ts builds a raw ChildLaunchSpec (see surface.ts) for every pi-CLI
+// child launch — initial spawn and resume alike — then renders it to exactly
+// one backend. renderTmuxCommand must stay byte-identical to the pre-spec
+// command construction (tests pin it): env order, shell quoting, and the
+// sentinel echo are all load-bearing.
+
+/**
+ * Render a launch spec as the shell command typed into a tmux pane.
+ * Byte-compatible with the original inline construction: env prefix in
+ * insertion order (PI_SUBAGENT_AUTO_EXIT deliberately unquoted, as before),
+ * cd prefix, then the pi argv with applySandboxToParts pushing model,
+ * identity, and default-deny flags in the historical order, then the
+ * positional prompt args, and the exit sentinel echo.
+ */
+function renderTmuxCommand(spec: ChildLaunchSpec): string {
+  const parts: string[] = ["pi"];
+  parts.push("--session", shellEscape(spec.sessionFile));
+  parts.push("-e", shellEscape(spec.subagentDonePath));
+  applySandboxToParts(parts, spec.loadout, { artifactDir: spec.artifactDir, name: spec.name });
+  for (const promptArg of spec.prompts) {
+    parts.push(shellEscape(promptArg));
+  }
+
+  const envPrefix =
+    Object.entries(spec.env)
+      .map(([key, value]) =>
+        // Historical quirk preserved: AUTO_EXIT was never shell-quoted.
+        key === "PI_SUBAGENT_AUTO_EXIT" ? `${key}=${value}` : `${key}=${shellEscape(value)}`,
+      )
+      .join(" ") + " ";
+  const cdPrefix = spec.cwd ? `cd ${shellEscape(spec.cwd)} && ` : "";
+
+  return `${cdPrefix}${envPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+}
+
+/** Filesystem-safe name for generated launch artifacts. */
+function safeArtifactName(name: string | undefined, fallback: string): string {
+  return (
+    (name || fallback)
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, "")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "") || fallback
+  );
+}
+
+/**
+ * Persist the launch spec for a headless child. tmux launches keep their
+ * shell script artifact for debugging; rpc launches get the same visibility
+ * via a JSON dump of argv, env, cwd, and prompts.
+ */
+function writeRpcLaunchArtifact(path: string, spec: ChildLaunchSpec, piCommand: string): void {
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(
+      path,
+      JSON.stringify(
+        {
+          kind: "rpc-launch",
+          command: piCommand,
+          sessionFile: spec.sessionFile,
+          subagentDonePath: spec.subagentDonePath,
+          env: spec.env,
+          cwd: spec.cwd,
+          prompts: spec.rpcPrompts ?? spec.prompts,
+          generated: new Date().toISOString(),
+        },
+        null,
+        2,
+      ) + "\n",
+      "utf8",
+    );
+  } catch {
+    // Debug artifact only — never fail a launch over it.
+  }
+}
+
 function activityLabel(activity: SubagentActivityState): string | undefined {
   if (activity.phase !== "active") return undefined;
   if (activity.activeScope === "tool") return activity.toolName ?? "tool";
@@ -992,23 +1180,28 @@ function resolveRunningByName(name: string):
 }
 
 /**
- * Type a follow-up message into a running subagent's live pane. Newlines are
- * collapsed to spaces because each newline submits a turn in the child's TUI
- * editor; a multi-line message would otherwise fire as several partial turns.
+ * Type a follow-up message into a running subagent's live pane. For tmux
+ * children newlines are collapsed to spaces because each newline submits a
+ * turn in the child's TUI editor; a multi-line message would otherwise fire
+ * as several partial turns. RPC children receive the message verbatim — it is
+ * delivered as a single RPC prompt command, queued until the current run
+ * settles (the same turn-boundary semantics, without the typing).
  */
 function steerSubagent(
   running: RunningSubagent,
   message: string,
-  send: (surface: string, command: string) => void = sendCommand,
+  send: (surface: string, command: string) => void = sendSurfaceCommand,
 ): { ok: true } | { error: string } {
-  const flattened = message.replace(/\s*\n\s*/g, " ").trim();
+  const payload = isRpcSurface(running.surface)
+    ? message.trim()
+    : message.replace(/\s*\n\s*/g, " ").trim();
   try {
-    send(running.surface, flattened);
+    send(running.surface, payload);
     return { ok: true };
   } catch (error: any) {
     return {
       error:
-        `Failed to deliver message to subagent "${running.name}" via tmux: ` +
+        `Failed to deliver message to subagent "${running.name}" via ${isRpcSurface(running.surface) ? "rpc" : "tmux"}: ` +
         `${error?.message ?? String(error)}`,
     };
   }
@@ -1016,7 +1209,7 @@ function steerSubagent(
 
 function handleSubagentSteer(
   params: { name?: string; message?: string },
-  send: (surface: string, command: string) => void = sendCommand,
+  send: (surface: string, command: string) => void = sendSurfaceCommand,
 ) {
   const message = params.message?.trim();
   if (!message) {
@@ -1148,6 +1341,10 @@ export const __test__ = {
   contextWindowFor,
   formatUsageSegments,
   widgetIcon,
+  renderTmuxCommand,
+  safeArtifactName,
+  buildPanesEntries,
+  panesTranscriptFor,
 };
 
 function startWidgetRefresh() {
@@ -1201,11 +1398,32 @@ async function launchSubagent(
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
-  // Use pre-created surface (parallel mode) or create a new one.
-  // For new surfaces, pause briefly so the shell is ready before sending the command.
+  // Backend choice happens before anything is built: it decides whether the
+  // child gets a tmux pane or a headless RPC process. Claude-CLI agents are
+  // always tmux (the claude CLI has no RPC mode), and that hard requirement
+  // must fail here — before createSurface's generic tmux error — so callers
+  // get the claude-specific hint.
+  const isClaudeCli = agentDefs?.cli === "claude";
+  const backend = resolveSurfaceBackend(isClaudeCli ? "claude" : "pi");
+  if (isClaudeCli && !isMuxAvailable()) {
+    throw new Error(
+      `Claude-CLI subagents require tmux. ${muxSetupHint()} ` +
+      `(pi subagents can run headless via surface.backend "rpc", but claude cannot.)`,
+    );
+  }
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
-  if (!surfacePreCreated) {
+  let surface: string;
+  if (surfacePreCreated) {
+    // Parallel mode: the caller already created the pane.
+    surface = options!.surface!;
+  } else if (backend === "rpc") {
+    // Headless child — spawned below once the launch env is fully assembled
+    // (createRpcSurface needs the complete spec). No shell, no ready delay.
+    surface = "";
+  } else {
+    // For new panes, pause briefly so the shell is ready before the command
+    // is typed into it (direnv/devenv setups can take a moment).
+    surface = createSurface(params.name);
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
 
@@ -1244,6 +1462,8 @@ async function launchSubagent(
     ? params.task
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
   // ── Claude Code CLI path ──
+  // (The tmux hard-requirement was already enforced at backend resolution,
+  // above, before any surface was created.)
   if (agentDefs?.cli === "claude") {
     const sentinelFile = `/tmp/pi-claude-${id}-done`;
     const pluginDir = join(SUBAGENTS_DIR, "plugin");
@@ -1314,12 +1534,7 @@ async function launchSubagent(
 
   // ── Pi CLI path ──
 
-  // Build pi command
-  const parts: string[] = ["pi"];
-  parts.push("--session", shellEscape(subagentSessionFile));
-
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-  parts.push("-e", shellEscape(subagentDonePath));
 
   // Resolve the config dir the child sees: a target-local .pi/agent/ wins,
   // else the propagated global dir. Captured once so the launch env and the
@@ -1352,33 +1567,6 @@ async function launchSubagent(
   };
   writeSubagentLoadout(subagentSessionFile, loadout);
 
-  // Apply model, identity, and the default-deny tool/extension restriction via
-  // the shared helper (same code path resume uses — they can't drift).
-  applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
-
-  // Build env prefix: subagent identity + config dir propagation + spawn allowlist
-  const envParts: string[] = [];
-
-  if (resolvedAgentDir) {
-    envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resolvedAgentDir)}`);
-  }
-
-  if (grantSpawning && agentDefs?.subagentAgents) {
-    envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
-  }
-  envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
-  if (params.agent) {
-    envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
-  }
-  if (agentDefs?.autoExit) {
-    envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
-  }
-  envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
-  envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
-  envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
-  envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
-  const envPrefix = envParts.join(" ") + " ";
-
   // Pass task and skill prompts to the sub-agent.
   // Only full-context fork mode gets a direct task argument because it already
   // inherits the parent conversation. Blank-session modes use artifact-backed
@@ -1388,49 +1576,91 @@ async function launchSubagent(
     taskArg = fullTask;
   } else {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const safeName = params.name
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "") // strip everything except alphanumeric, spaces, hyphens
-      .replace(/\s+/g, "-") // spaces to hyphens
-      .replace(/-+/g, "-") // collapse multiple hyphens
-      .replace(/^-|-$/g, ""); // trim leading/trailing hyphens
-    const artifactName = `context/${safeName || "subagent"}-${timestamp}.md`;
+    const safeName = safeArtifactName(params.name, "subagent");
+    const artifactName = `context/${safeName}-${timestamp}.md`;
     const artifactPath = join(artifactDir, artifactName);
     mkdirSync(dirname(artifactPath), { recursive: true });
     writeFileSync(artifactPath, fullTask, "utf8");
     taskArg = `@${artifactPath}`;
   }
 
-  for (const promptArg of buildPiPromptArgs({
-    effectiveSkills,
-    taskDelivery: launchBehavior.taskDelivery,
-    taskArg,
-  })) {
-    parts.push(shellEscape(promptArg));
+  // Build the launch env: subagent identity + config dir propagation +
+  // spawn allowlist. Insertion order is the emission order renderTmuxCommand
+  // relies on — keep it stable.
+  const env: Record<string, string> = {};
+  if (resolvedAgentDir) {
+    env.PI_CODING_AGENT_DIR = resolvedAgentDir;
   }
+  if (grantSpawning && agentDefs?.subagentAgents) {
+    env.PI_SUBAGENT_ALLOWED = agentDefs.subagentAgents.join(",");
+  }
+  env.PI_SUBAGENT_NAME = params.name;
+  if (params.agent) {
+    env.PI_SUBAGENT_AGENT = params.agent;
+  }
+  if (agentDefs?.autoExit) {
+    env.PI_SUBAGENT_AUTO_EXIT = "1";
+  }
+  env.PI_SUBAGENT_SESSION = subagentSessionFile;
+  env.PI_SUBAGENT_ID = id;
+  env.PI_SUBAGENT_ACTIVITY_FILE = activityFile;
 
-  // Resolve cwd — param overrides agent default, supports absolute and relative paths.
-  // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
-  const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
+  const spec: ChildLaunchSpec = {
+    kind: "pi",
+    sessionFile: subagentSessionFile,
+    subagentDonePath,
+    loadout,
+    artifactDir,
+    name: params.name,
+    env,
+    cwd: effectiveCwd,
+    // Raw CLI positional prompts — what the tmux renderer types into the pane.
+    prompts: buildPiPromptArgs({
+      effectiveSkills,
+      taskDelivery: launchBehavior.taskDelivery,
+      taskArg,
+    }),
+    // Effective RPC sequence — mirrors what pi's CLI arg parsing would have
+    // done with `prompts` (initial-message quirk included): artifact delivery
+    // runs the task first with skills as follow-ups, direct delivery runs
+    // skills first. "@file" args are inlined because RPC prompts do not
+    // expand @-references.
+    rpcPrompts: buildRpcPrompts({
+      effectiveSkills,
+      taskDelivery: launchBehavior.taskDelivery,
+      taskArg,
+    }),
+  };
 
-  const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
-  const launchScriptName = `${(params.name || "subagent")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, "")
-    .replace(/\s+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
-  const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-  sendLongCommand(surface, command, {
-    scriptPath: launchScriptFile,
-    scriptPreamble: [
-      `# Subagent launch script for ${params.name}`,
-      `# Generated: ${new Date().toISOString()}`,
-      `# Session: ${subagentSessionFile}`,
-      `# Surface: ${surface}`,
-    ].join("\n"),
-  });
+  const launchScriptFile = join(
+    artifactDir,
+    "subagent-scripts",
+    `${safeArtifactName(params.name, "subagent")}-${id}${backend === "rpc" ? ".rpc.json" : ".sh"}`,
+  );
+
+  if (backend === "rpc") {
+    // Headless: spawn `pi --mode rpc` with the spec's argv/env and feed the
+    // prompts as sequential RPC prompt commands (queued one run at a time).
+    // createRpcSurface injects PI_SUBAGENT_SURFACE with its own id.
+    surface = createRpcSurface(spec, {
+      autoExit: !!agentDefs?.autoExit,
+      onChange: notifyPanesChanged,
+    });
+    writeRpcLaunchArtifact(launchScriptFile, spec, "pi --mode rpc");
+  } else {
+    // Historical path: type the rendered shell command into the pane.
+    env.PI_SUBAGENT_SURFACE = surface;
+    const command = renderTmuxCommand(spec);
+    sendLongCommand(surface, command, {
+      scriptPath: launchScriptFile,
+      scriptPreamble: [
+        `# Subagent launch script for ${params.name}`,
+        `# Generated: ${new Date().toISOString()}`,
+        `# Session: ${subagentSessionFile}`,
+        `# Surface: ${surface}`,
+      ].join("\n"),
+    });
+  }
 
   const running: RunningSubagent = {
     id,
@@ -1528,7 +1758,7 @@ async function watchSubagent(
   const { name, task, surface, startTime, sessionFile } = running;
 
   try {
-    const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
+    const result = await pollSurfaceForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
@@ -1570,7 +1800,7 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      closeSurface(surface);
+      closeSurfaceAny(surface);
       runningSubagents.delete(running.id);
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
@@ -1598,7 +1828,7 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    closeSurface(surface);
+    closeSurfaceAny(surface);
     runningSubagents.delete(running.id);
 
     return {
@@ -1614,7 +1844,7 @@ async function watchSubagent(
     };
   } catch (err: any) {
     try {
-      closeSurface(surface);
+      closeSurfaceAny(surface);
     } catch {}
     runningSubagents.delete(running.id);
 
@@ -1653,6 +1883,28 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (!prevAbort || prevAbort.signal.aborted) {
       (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
     }
+
+    // Mount (or re-mount) the panes dashboard. Re-mounting on every
+    // session_start is deliberate: pi's resetExtensionUI can unmount
+    // extension overlays between sessions, so a stale mount would silently
+    // stop rendering.
+    if (surfaceConfig().panesEnabled && (ctx as any).ui?.custom) {
+      initPanesDashboard(ctx as any, {
+        getEntries: () => buildPanesEntries(),
+        steer: (name, message) => {
+          // Same delivery path the subagent_message tool uses; the result is
+          // surfaced so the composer can tell the user about a failure
+          // instead of closing as if the message had been sent.
+          const result = handleSubagentSteer({ name, message }) as any;
+          if (result?.details?.error) {
+            return {
+              error: String(result.content?.[0]?.text ?? result.details.error),
+            };
+          }
+          return { ok: true as const };
+        },
+      });
+    }
   });
 
   // Clean up on session shutdown
@@ -1673,7 +1925,25 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       agent.abortController?.abort();
     }
     runningSubagents.clear();
+    // Headless children have no pane to outlive us — take their process
+    // groups down with the session (the tmux equivalent of kill-pane).
+    closeAllRpcSurfaces();
   });
+
+  // Panes dashboard toggle. Registered as a global shortcut so it fires while
+  // pi's own editor has focus; the overlay itself is non-capturing until the
+  // dashboard explicitly takes focus (see panes.ts).
+  try {
+    pi.registerShortcut("ctrl+alt+p", {
+      description: "Toggle the subagent panes dashboard",
+      handler: () => {
+        togglePanesDashboard();
+      },
+    });
+  } catch {
+    // Shortcut registration is best-effort: a conflicting keybind in the
+    // host pi must not take down the extension.
+  }
 
   // The spawning tools are always registered here. Whether a child process can
   // actually see/use them is governed by the parent's `--tools` allowlist and
@@ -1758,9 +2028,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // Validate prerequisites (need mux + a session file to derive the
-        // artifact dir that hosts this session's name registry).
-        if (!isMuxAvailable()) {
+        // Validate prerequisites (need a usable surface backend + a session
+        // file to derive the artifact dir that hosts this session's name
+        // registry). Headless mode needs no multiplexer — the gate only
+        // applies when the backend actually resolved to tmux. Resolve with
+        // the spawn's agent type so the gate and launchSubagent agree (a
+        // claude agent resolves to tmux even on an rpc-forced config).
+        if (agentSurfaceBackend(params.agent) === "tmux" && !isMuxAvailable()) {
           return muxUnavailableResult();
         }
 
@@ -2078,7 +2352,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
-        if (!isMuxAvailable()) {
+        // Steer targets an existing surface (its id picks the channel), and
+        // resume always relaunches pi — so the gate is pi-typed.
+        if (resolveSurfaceBackend("pi") === "tmux" && !isMuxAvailable()) {
           return muxUnavailableResult();
         }
 
@@ -2149,23 +2425,28 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // transcript doesn't block the UI.
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
-        const surface = createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        // Backend choice mirrors a fresh spawn: headless outside tmux unless
+        // configured otherwise. Claude-CLI resumes don't exist (resume always
+        // relaunches pi), so the agentType is "pi".
+        const resumeBackend = resolveSurfaceBackend("pi");
+        let surface: string;
+        if (resumeBackend === "rpc") {
+          // Spawned below, once the resume env is assembled.
+          surface = "";
+        } else {
+          surface = createSurface(name);
+          await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        }
 
-        // Build pi resume command
-        const parts = ["pi", "--session", shellEscape(sessionPath)];
-
-        // Load subagent-done extension so the agent can self-terminate if needed
-        const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-        parts.push("-e", shellEscape(subagentDonePath));
-
+        // Build the resume launch spec. Same renderer split as a fresh
+        // spawn: the tmux command must stay byte-identical to the historical
+        // construction; the rpc renderer spawns headless and queues the
+        // resume message as a single prompt (inlined — RPC prompts do not
+        // expand @files).
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
-
-        // Replay the model, identity, and default-deny tool/extension sandbox.
-        applySandboxToParts(parts, loadout, { artifactDir, name });
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
@@ -2173,66 +2454,87 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           resumeMsgFile = join(
             artifactDir,
             "subagent-resume",
-            `${name
-              .toLowerCase()
-              .replace(/[^a-z0-9\s-]/g, "")
-              .replace(/\s+/g, "-")
-              .replace(/-+/g, "-")
-              .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
+            `${safeArtifactName(name, "resume")}-${msgTimestamp}.md`,
           );
           mkdirSync(dirname(resumeMsgFile), { recursive: true });
           writeFileSync(resumeMsgFile, message, "utf8");
-          parts.push(shellEscape(`@${resumeMsgFile}`));
         }
 
-        // Build env prefix — replay the snapshot's config dir + spawn whitelist
-        // so the resumed process resolves the same agents/extensions and keeps
+        // Env prefix — replay the snapshot's config dir + spawn whitelist so
+        // the resumed process resolves the same agents/extensions and keeps
         // the same nested-spawn restriction it originally ran with.
-        const resumeEnvParts: string[] = [];
+        // Insertion order matches the historical emission order.
+        const resumeEnv: Record<string, string> = {};
         const resumeAgentDir = loadout.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? null;
         if (resumeAgentDir) {
-          resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resumeAgentDir)}`);
+          resumeEnv.PI_CODING_AGENT_DIR = resumeAgentDir;
         }
         if (loadout.spawnable && loadout.spawnable.length > 0) {
-          resumeEnvParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(loadout.spawnable.join(","))}`);
+          resumeEnv.PI_SUBAGENT_ALLOWED = loadout.spawnable.join(",");
         }
         if (loadout.agent) {
-          resumeEnvParts.push(`PI_SUBAGENT_AGENT=${shellEscape(loadout.agent)}`);
+          resumeEnv.PI_SUBAGENT_AGENT = loadout.agent;
         }
-        resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(sessionPath)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
+        resumeEnv.PI_SUBAGENT_NAME = name;
+        resumeEnv.PI_SUBAGENT_SESSION = sessionPath;
+        resumeEnv.PI_SUBAGENT_ID = id;
+        resumeEnv.PI_SUBAGENT_ACTIVITY_FILE = activityFile;
         if (autoExit) {
-          resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
+          resumeEnv.PI_SUBAGENT_AUTO_EXIT = "1";
         }
-        const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
-        // Resume in the subagent's original cwd so its tools (safe_bash, edits)
-        // operate where they did before.
-        const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
+        const resumeSpec: ChildLaunchSpec = {
+          kind: "pi",
+          sessionFile: sessionPath,
+          subagentDonePath: join(SUBAGENTS_DIR, "subagent-done.ts"),
+          loadout,
+          artifactDir,
+          name,
+          env: resumeEnv,
+          // Resume in the subagent's original cwd so its tools (safe_bash,
+          // edits) operate where they did before.
+          cwd: loadout.cwd,
+          prompts: resumeMsgFile ? [`@${resumeMsgFile}`] : [],
+          // Mirror the CLI's @file expansion (the tmux child gets the
+          // wrapped form from argv parsing; the rpc child must match).
+          rpcPrompts: resumeMsgFile ? [expandFileRefForRpc(`@${resumeMsgFile}`)] : [],
+        };
 
-        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
-          `${name
-            .toLowerCase()
-            .replace(/[^a-z0-9\s-]/g, "")
-            .replace(/\s+/g, "-")
-            .replace(/-+/g, "-")
-            .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
+          `${safeArtifactName(name, "resume")}-resume-${Date.now()}${resumeBackend === "rpc" ? ".rpc.json" : ".sh"}`,
         );
-        sendLongCommand(surface, command, {
-          scriptPath: launchScriptFile,
-          scriptPreamble: [
-            `# Subagent resume script for ${name}`,
-            `# Generated: ${new Date().toISOString()}`,
-            `# Session: ${sessionPath}`,
-            `# Surface: ${surface}`,
-            ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
-          ].join("\n"),
-        });
+
+        if (resumeBackend === "rpc") {
+          if (!message) {
+            // A headless child has no visible pane to drive: without a
+            // prompt it would idle forever and the watcher would never
+            // resolve. (The tmux backend keeps its historical no-op here —
+            // the pane is visible and drivable.)
+            throw new Error(
+              `Cannot resume subagent "${name}" headless without a message — ` +
+              `an rpc child has no pane to interact with. Provide a message.`,
+            );
+          }
+          surface = createRpcSurface(resumeSpec, {
+            autoExit,
+            onChange: notifyPanesChanged,
+          });
+          writeRpcLaunchArtifact(launchScriptFile, resumeSpec, "pi --mode rpc");
+        } else {
+          const command = renderTmuxCommand(resumeSpec);
+          sendLongCommand(surface, command, {
+            scriptPath: launchScriptFile,
+            scriptPreamble: [
+              `# Subagent resume script for ${name}`,
+              `# Generated: ${new Date().toISOString()}`,
+              `# Session: ${sessionPath}`,
+              `# Surface: ${surface}`,
+              ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
+            ].join("\n"),
+          });
+        }
 
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {

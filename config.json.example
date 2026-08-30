@@ -1,5 +1,11 @@
 {
   "status": {
     "enabled": true
+  },
+  "surface": {
+    "backend": "auto",
+    "panes": {
+      "enabled": true
+    }
   }
 }
