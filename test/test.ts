@@ -1,7 +1,7 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
@@ -1363,6 +1363,38 @@ describe("subagent discovery", () => {
       testApi.buildPiPromptArgs({ effectiveSkills: "review", taskDelivery: "direct", taskArg: "do the task" }),
       ["/skill:review", "do the task"],
     );
+  });
+
+  it("findSkillFile resolves project and home skill layouts", () => {
+    const dir = createTestDir();
+    const projectSkill = join(dir, "project", ".pi", "skills", "zz-test-skill-a", "SKILL.md");
+    mkdirSync(dirname(projectSkill), { recursive: true });
+    writeFileSync(projectSkill, "# A\n", "utf8");
+    const rootSkill = join(dir, "project", ".pi", "skills", "zz-test-skill-b.md");
+    writeFileSync(rootSkill, "# B\n", "utf8");
+
+    assert.equal(testApi.findSkillFile("zz-test-skill-a", join(dir, "project")), projectSkill);
+    assert.equal(testApi.findSkillFile("zz-test-skill-b", join(dir, "project")), rootSkill);
+    assert.equal(testApi.findSkillFile("zz-test-skill-missing", join(dir, "project")), null);
+  });
+
+  it("resolveSkillBlocks inlines resolved skills and defers unresolved ones", () => {
+    const dir = createTestDir();
+    const projectDir = join(dir, "project");
+    const skillFile = join(projectDir, ".pi", "skills", "zz-test-skill-c", "SKILL.md");
+    mkdirSync(dirname(skillFile), { recursive: true });
+    writeFileSync(skillFile, "# C\nBody here.\n", "utf8");
+
+    const result = testApi.resolveSkillBlocks("zz-test-skill-c, zz-test-skill-d", projectDir);
+    assert.deepEqual(result.unresolved, ["zz-test-skill-d"]);
+    assert.equal(result.inlineBlocks.length, 1);
+    assert.match(result.inlineBlocks[0], /<skill name=\"zz-test-skill-c\"/);
+    assert.ok(result.inlineBlocks[0].includes(`location="${skillFile}"`));
+    assert.match(result.inlineBlocks[0], /References are relative to/);
+    assert.match(result.inlineBlocks[0], /Body here\./);
+
+    assert.deepEqual(testApi.resolveSkillBlocks(undefined, projectDir), { inlineBlocks: [], unresolved: [] });
+    assert.deepEqual(testApi.resolveSkillBlocks("  , ", projectDir), { inlineBlocks: [], unresolved: [] });
   });
 
   it("lists visible agents from discovery", async () => {

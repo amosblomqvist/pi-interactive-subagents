@@ -895,6 +895,60 @@ function buildPiPromptArgs(params: {
   ];
 }
 
+/**
+ * Locate a skill file by name, mirroring pi's documented discovery
+ * locations (~/.pi/agent/skills, ~/.agents/skills, .pi/skills,
+ * .agents/skills). In the two .pi roots a root-level `<name>.md` file is
+ * also a valid skill.
+ */
+function findSkillFile(name: string, cwd: string): string | null {
+  const home = homedir();
+  const roots = [
+    join(home, ".pi", "agent", "skills"),
+    join(cwd, ".pi", "skills"),
+    join(cwd, ".agents", "skills"),
+    join(home, ".agents", "skills"),
+  ];
+  for (const root of roots) {
+    const candidates = [join(root, name, "SKILL.md"), join(root, `${name}.md`)];
+    for (const candidate of candidates) {
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve `skills:` frontmatter names to inlined skill blocks.
+ *
+ * pi's /skill: command is delivered as a follow-up prompt, which races
+ * auto-exit shutdown: an auto-exit child that finishes its first turn can be
+ * shut down while queued /skill: prompts are still pending, silently
+ * dropping the 2nd+ skill. Inlining the resolved content into the task
+ * (the first user message) makes loading deterministic. Names that cannot
+ * be resolved are returned so the caller can fall back to /skill: prompts
+ * (e.g. package-provided skills outside the documented locations).
+ */
+function resolveSkillBlocks(skillsCsv: string | undefined, cwd: string): {
+  inlineBlocks: string[];
+  unresolved: string[];
+} {
+  const inlineBlocks: string[] = [];
+  const unresolved: string[] = [];
+  for (const name of (skillsCsv ?? "").split(",").map((s) => s.trim()).filter(Boolean)) {
+    const file = findSkillFile(name, cwd);
+    if (!file) {
+      unresolved.push(name);
+      continue;
+    }
+    const body = readFileSync(file, "utf8");
+    inlineBlocks.push(
+      `<skill name="${name}" location="${file}">\nReferences are relative to ${dirname(file)}.\n\n${body.trimEnd()}\n</skill>`,
+    );
+  }
+  return { inlineBlocks, unresolved };
+}
+
 function activityLabel(activity: SubagentActivityState): string | undefined {
   if (activity.phase !== "active") return undefined;
   if (activity.activeScope === "tool") return activity.toolName ?? "tool";
@@ -1131,6 +1185,8 @@ export const __test__ = {
   buildSubagentToolAllowlist,
   applySandboxToParts,
   buildPiPromptArgs,
+  findSkillFile,
+  resolveSkillBlocks,
   formatWidgetRightLabel,
   observeRunningSubagent,
   getToolExtensionPath,
@@ -1240,9 +1296,18 @@ async function launchSubagent(
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
   const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
-  const fullTask = inheritsConversationContext
-    ? params.task
-    : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
+  // Deterministic skill loading: resolve names to file content and inline the
+  // blocks into the task (first user message). /skill: follow-up prompts race
+  // auto-exit shutdown and silently drop the 2nd+ skill; see resolveSkillBlocks.
+  const { inlineBlocks: inlineSkillBlocks, unresolved: unresolvedSkills } = resolveSkillBlocks(
+    effectiveSkills,
+    targetCwdForSession,
+  );
+  const skillBlock = inlineSkillBlocks.length > 0 ? `\n\n${inlineSkillBlocks.join("\n\n")}` : "";
+  const fullTask =
+    (inheritsConversationContext
+      ? params.task
+      : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`) + skillBlock;
   // ── Claude Code CLI path ──
   if (agentDefs?.cli === "claude") {
     const sentinelFile = `/tmp/pi-claude-${id}-done`;
@@ -1401,8 +1466,10 @@ async function launchSubagent(
     taskArg = `@${artifactPath}`;
   }
 
+  // Only unresolved skills fall back to /skill: follow-up prompts; resolved
+  // ones are already inlined into fullTask (see resolveSkillBlocks).
   for (const promptArg of buildPiPromptArgs({
-    effectiveSkills,
+    effectiveSkills: unresolvedSkills.join(","),
     taskDelivery: launchBehavior.taskDelivery,
     taskArg,
   })) {
