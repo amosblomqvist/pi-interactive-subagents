@@ -72,7 +72,8 @@ function windowsPathForPosixShell(value: string): string {
 }
 
 /**
- * Resolve quoting only when the pane shell is explicit or unambiguous.
+ * Windows requires an explicit new-tab shell declaration; the caller's SHELL
+ * may differ from Herdr's configured tab shell and is never inferred.
  * cmd.exe is deliberately unsupported because `%VAR%` expands inside quotes.
  */
 export function resolveViewerShell(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): ViewerShell {
@@ -86,10 +87,8 @@ export function resolveViewerShell(platform: NodeJS.Platform, env: NodeJS.Proces
     throw new Error(`Unsupported PI_SUBAGENT_HERDR_SHELL value: ${explicit}`);
   }
   if (platform !== "win32") return "posix";
-  const shell = env.SHELL?.trim().toLowerCase() ?? "";
-  if (/(?:^|[\\/])(bash|sh|zsh)(?:\.exe)?$/u.test(shell)) return "posix";
   throw new Error(
-    "Cannot safely determine the Herdr pane shell on Windows. Set PI_SUBAGENT_HERDR_SHELL=powershell or git-bash; cmd.exe is unsupported.",
+    "Windows Herdr viewer requires PI_SUBAGENT_HERDR_SHELL=powershell or git-bash to describe the configured shell of newly created tabs; caller SHELL is not authoritative. cmd.exe is unsupported.",
   );
 }
 
@@ -208,6 +207,16 @@ export class HerdrViewerManager {
   }
 
   private async createViewer(target: ViewerTarget, workspace: string): Promise<void> {
+    // Validate shell selection, absolute runtime resolution, and every quoted
+    // path before creating any Herdr resource. pane run only acknowledges text
+    // submission; it does not prove that this command later starts correctly.
+    const viewerCommand = buildViewerCommand({
+      platform: this.platform,
+      shell: this.shell ?? resolveViewerShell(this.platform, this.env),
+      nodeExecutable: this.nodeExecutable,
+      viewerScript: this.viewerScript,
+      snapshotFile: target.snapshotFile,
+    });
     const label = `Subagent ${sanitizeMonitorText(target.name, 48) || target.id}`;
     const createArgs = [
       "tab", "create",
@@ -222,13 +231,6 @@ export class HerdrViewerManager {
 
     try {
       if (!requestCurrent(target)) throw new Error("Herdr viewer request belongs to a retired Pi session.");
-      const viewerCommand = buildViewerCommand({
-        platform: this.platform,
-        shell: this.shell ?? resolveViewerShell(this.platform, this.env),
-        nodeExecutable: this.nodeExecutable,
-        viewerScript: this.viewerScript,
-        snapshotFile: target.snapshotFile,
-      });
       const ran = await this.exec(this.executable, ["pane", "run", paneId, viewerCommand]);
       if (ran.code !== 0) throw commandError("pane run", ran);
       if (!requestCurrent(target)) throw new Error("Herdr viewer request belongs to a retired Pi session.");

@@ -78,6 +78,21 @@ test("missing caller Herdr workspace fails closed without UI-focused fallback", 
   assert.equal(calls, 0);
 });
 
+test("Windows caller SHELL is not trusted for a new tab and missing override creates nothing", async () => {
+  let calls = 0;
+  const manager = new HerdrViewerManager({
+    exec: async () => { calls++; return { stdout: "", stderr: "", code: 0 }; },
+    env: {
+      HERDR_ENV: "1",
+      HERDR_WORKSPACE_ID: "w1",
+      SHELL: "C:\\Program Files\\Git\\bin\\bash.exe",
+    },
+    platform: "win32",
+  });
+  await assert.rejects(manager.openOrFocus(target()), /requires PI_SUBAGENT_HERDR_SHELL.*caller SHELL is not authoritative/i);
+  assert.equal(calls, 0);
+});
+
 test("absent Herdr is a clear non-mutating fallback", async () => {
   let calls = 0;
   const manager = new HerdrViewerManager({
@@ -169,9 +184,12 @@ test("retirement while pane run is pending prevents late focus and cleans the cr
 
 test("shell resolution is explicit and bare Node fallback is refused", () => {
   assert.equal(resolveViewerShell("linux", {}), "posix");
-  assert.equal(resolveViewerShell("win32", { SHELL: "C:\\Program Files\\Git\\bin\\bash.exe" }), "posix");
+  assert.equal(resolveViewerShell("win32", { PI_SUBAGENT_HERDR_SHELL: "git-bash" }), "posix");
   assert.equal(resolveViewerShell("win32", { PI_SUBAGENT_HERDR_SHELL: "powershell" }), "powershell");
-  assert.throws(() => resolveViewerShell("win32", {}), /cannot safely determine/i);
+  assert.throws(
+    () => resolveViewerShell("win32", { SHELL: "C:\\Program Files\\Git\\bin\\bash.exe" }),
+    /requires PI_SUBAGENT_HERDR_SHELL.*caller SHELL is not authoritative/i,
+  );
   assert.throws(() => resolveViewerShell("win32", { PI_SUBAGENT_HERDR_SHELL: "cmd" }), /cmd\.exe is not supported/i);
   assert.throws(() => buildViewerCommand({
     platform: "win32", shell: "powershell", nodeExecutable: "node.exe", viewerScript: "safe", snapshotFile: "safe",
