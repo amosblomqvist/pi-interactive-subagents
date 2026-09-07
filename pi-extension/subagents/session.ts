@@ -3,6 +3,7 @@ import {
   closeSync,
   copyFileSync,
   existsSync,
+  fstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -131,16 +132,50 @@ export function writeSubagentLoadout(sessionFile: string, loadout: SubagentLoado
   }
 }
 
-/** Read a subagent's loadout snapshot, or null if absent/unparseable. */
+const LOADOUT_KEYS = [
+  "agent", "toolAllowlist", "model", "thinking", "systemPromptMode",
+  "identity", "spawnable", "autoExit", "cwd", "agentDir",
+] as const;
+
+function nullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
+
+function validSubagentLoadout(value: unknown): value is SubagentLoadout {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const input = value as Record<string, unknown>;
+  if (Object.keys(input).length !== LOADOUT_KEYS.length) return false;
+  if (!LOADOUT_KEYS.every((key) => Object.hasOwn(input, key))) return false;
+  if (!nullableString(input.agent) || !nullableString(input.toolAllowlist)) return false;
+  if (!nullableString(input.model) || !nullableString(input.thinking)) return false;
+  if (input.systemPromptMode !== null && input.systemPromptMode !== "append" && input.systemPromptMode !== "replace") return false;
+  if (!nullableString(input.identity) || !nullableString(input.cwd) || !nullableString(input.agentDir)) return false;
+  if (typeof input.autoExit !== "boolean") return false;
+  if (input.spawnable !== null && (
+    !Array.isArray(input.spawnable) ||
+    input.spawnable.length > 1_000 ||
+    input.spawnable.some((name) => typeof name !== "string" || !name || name.length > 200)
+  )) return false;
+  return true;
+}
+
+/** Read a complete validated sandbox snapshot, or null if absent/malformed. */
 export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null {
+  const p = loadoutSidecarPath(sessionFile);
+  if (!existsSync(p)) return null;
+  let fd: number | undefined;
   try {
-    const p = loadoutSidecarPath(sessionFile);
-    if (!existsSync(p)) return null;
-    const parsed = JSON.parse(readFileSync(p, "utf8"));
-    if (!parsed || typeof parsed !== "object") return null;
-    return parsed as SubagentLoadout;
+    fd = openSync(p, "r");
+    const size = fstatSync(fd).size;
+    if (size < 1 || size > 64 * 1024) return null;
+    const buffer = Buffer.alloc(size);
+    const bytesRead = readSync(fd, buffer, 0, size, 0);
+    const parsed: unknown = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"));
+    return validSubagentLoadout(parsed) ? parsed : null;
   } catch {
     return null;
+  } finally {
+    if (fd != null) closeSync(fd);
   }
 }
 

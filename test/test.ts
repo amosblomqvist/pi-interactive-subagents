@@ -385,6 +385,39 @@ describe("session.ts", () => {
       writeFileSync(sf + ".loadout.json", "not json{", "utf8");
       assert.equal(readSubagentLoadout(sf), null);
     });
+
+    it("refuses empty, partial, extra-key, and oversized loadout sidecars", () => {
+      const sf = join(dir, "s4.jsonl");
+      for (const malformed of [
+        {},
+        { toolAllowlist: null, spawnable: null },
+        { ...sample, toolAllowlist: undefined },
+        { ...sample, unexpected: true },
+      ]) {
+        writeFileSync(sf + ".loadout.json", JSON.stringify(malformed), "utf8");
+        assert.equal(readSubagentLoadout(sf), null);
+      }
+      writeFileSync(sf + ".loadout.json", JSON.stringify({ ...sample, identity: "x".repeat(70_000) }), "utf8");
+      assert.equal(readSubagentLoadout(sf), null);
+    });
+
+    it("preserves intentional null sandbox semantics only in a complete schema", () => {
+      const sf = join(dir, "s5.jsonl");
+      const completeNulls: SubagentLoadout = {
+        agent: null,
+        toolAllowlist: null,
+        model: null,
+        thinking: null,
+        systemPromptMode: null,
+        identity: null,
+        spawnable: null,
+        autoExit: false,
+        cwd: null,
+        agentDir: null,
+      };
+      writeFileSync(sf + ".loadout.json", JSON.stringify(completeNulls), "utf8");
+      assert.deepEqual(readSubagentLoadout(sf), completeNulls);
+    });
   });
 
   describe("subagent name registry", () => {
@@ -2641,6 +2674,20 @@ describe("subagent activity snapshots", () => {
         assert.equal(read.ok, false);
         assert.equal((read as { ok: false; reason: string }).reason, "invalid");
       }
+    });
+  });
+
+  it("bounds activity reads and refuses path-traversing child ids", () => {
+    withTempDir((dir) => {
+      assert.throws(() => getSubagentActivityFile(dir, "../../escaped"), /unsafe subagent activity id/i);
+      const activityFile = getSubagentActivityFile(dir, "child-large");
+      mkdirSync(join(dir, "subagent-activity"), { recursive: true });
+      writeFileSync(activityFile, "x".repeat(70_000));
+      assert.deepEqual(readSubagentActivityFile(activityFile, "child-large"), {
+        ok: false,
+        reason: "invalid",
+        error: "activity file exceeds bounded read size",
+      });
     });
   });
 

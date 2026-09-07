@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 export type SubagentActivityPhase = "starting" | "active" | "waiting" | "done";
@@ -99,8 +99,11 @@ const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
   "session_shutdown",
 ]);
 const MAX_ACTIVITY_STRING_LENGTH = 200;
+const MAX_ACTIVITY_FILE_BYTES = 64 * 1024;
+const SAFE_ACTIVITY_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$/u;
 
 export function getSubagentActivityFile(artifactDir: string, runningChildId: string): string {
+  if (!SAFE_ACTIVITY_ID.test(runningChildId)) throw new Error("Unsafe subagent activity id");
   return join(artifactDir, "subagent-activity", `${runningChildId}.json`);
 }
 
@@ -193,11 +196,21 @@ export function readSubagentActivityFile(
   if (!existsSync(activityFile)) return { ok: false, reason: "missing" };
 
   let parsed: unknown;
+  let fd: number | undefined;
   try {
-    parsed = JSON.parse(readFileSync(activityFile, "utf8"));
+    fd = openSync(activityFile, "r");
+    const size = fstatSync(fd).size;
+    if (size > MAX_ACTIVITY_FILE_BYTES) {
+      return { ok: false, reason: "invalid", error: "activity file exceeds bounded read size" };
+    }
+    const buffer = Buffer.alloc(size);
+    const bytesRead = readSync(fd, buffer, 0, size, 0);
+    parsed = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { ok: false, reason: "invalid", error: message };
+  } finally {
+    if (fd != null) closeSync(fd);
   }
 
   return validateActivity(parsed, expectedRunningChildId);

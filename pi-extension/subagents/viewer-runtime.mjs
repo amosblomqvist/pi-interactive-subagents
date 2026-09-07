@@ -50,6 +50,14 @@ function render() {
     lines.push(`${clean(snapshot.name, 100)} [${clean(snapshot.id, 100)}]`);
     lines.push(`role: ${clean(snapshot.agent ?? "(none)", 100)} · depth: ${Number(snapshot.depth) || 0}`);
     lines.push(`status: ${clean(snapshot.status, 120)} · elapsed: ${clean(snapshot.elapsed, 40)}`);
+    const updatedAt = Number(snapshot.updatedAt);
+    const ageMs = Number.isFinite(updatedAt) ? Math.max(0, Date.now() - updatedAt) : Number.POSITIVE_INFINITY;
+    const disconnected = snapshot.terminal === true || ageMs >= 5_000;
+    lines.push(
+      disconnected
+        ? `connection: disconnected · snapshot ${Number.isFinite(ageMs) ? `${Math.floor(ageMs / 1000)}s old` : "age unknown"}`
+        : "connection: live snapshot",
+    );
     lines.push("", "Observable events (thinking/reasoning excluded):");
     const events = Array.isArray(snapshot.events) ? snapshot.events.slice(-20) : [];
     if (events.length === 0) lines.push("  No persisted events yet.");

@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -6,6 +5,7 @@ import {
   validateDelegationLimits,
   type DelegationLimits,
 } from "./lineage.ts";
+import { readSubagentsConfigSource } from "./config-source.ts";
 
 const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
@@ -14,23 +14,6 @@ const EXAMPLE_CONFIG_PATH = join(PACKAGE_ROOT, "config.json.example");
 export interface RuntimeConfig {
   delegation: DelegationLimits;
   herdrViewer: { enabled: boolean };
-}
-
-function readConfig(configPath: string, examplePath: string): { path: string; value: unknown } {
-  let path = configPath;
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    path = examplePath;
-    raw = readFileSync(path, "utf8");
-  }
-  try {
-    return { path, value: JSON.parse(raw) };
-  } catch (error) {
-    throw new Error(`Invalid JSON in subagent config ${path}: ${error instanceof Error ? error.message : String(error)}`);
-  }
 }
 
 export function parseRuntimeConfig(value: unknown, source = "config.json"): RuntimeConfig {
@@ -69,7 +52,21 @@ export function parseRuntimeConfig(value: unknown, source = "config.json"): Runt
 export function loadRuntimeConfig(
   configPath = DEFAULT_CONFIG_PATH,
   examplePath = EXAMPLE_CONFIG_PATH,
+  env: NodeJS.ProcessEnv = process.env,
 ): RuntimeConfig {
-  const loaded = readConfig(configPath, examplePath);
-  return parseRuntimeConfig(loaded.value, loaded.path);
+  const loaded = readSubagentsConfigSource({
+    configPath,
+    examplePath,
+    env,
+    // Explicit non-default paths are API/test fixtures and retain fallback;
+    // normal extension loading honors the external absolute env override.
+    honorExternal: configPath === DEFAULT_CONFIG_PATH && examplePath === EXAMPLE_CONFIG_PATH,
+  });
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(loaded.rawConfig);
+  } catch (error) {
+    throw new Error(`Invalid JSON in subagent config ${loaded.sourcePath}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return parseRuntimeConfig(parsed, loaded.sourcePath);
 }

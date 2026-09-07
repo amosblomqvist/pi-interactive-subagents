@@ -694,12 +694,29 @@ function lineageEnvironmentParts(context: LineageContext, childDepth: number): s
 
 const statusConfig = loadStatusConfig();
 const runtimeConfig = loadRuntimeConfig();
-const HERDR_VIEWER_KEY = Symbol.for("pi-subagents/herdr-viewer-manager");
+const HERDR_VIEWER_KEY = Symbol.for("pi-subagents/herdr-viewer-manager-v2");
 const herdrViewer = ((globalThis as any)[HERDR_VIEWER_KEY] as HerdrViewerManager | undefined)
   ?? new HerdrViewerManager();
 (globalThis as any)[HERDR_VIEWER_KEY] = herdrViewer;
 let latestLineageFile: string | null = null;
 let latestLineageReconcileAt = 0;
+
+type SurfaceCloseOutcome = { releaseLease: boolean; error?: Error };
+
+function closeSurfaceForLineage(
+  surface: string,
+  close: (surface: string) => void = closeSurface,
+): SurfaceCloseOutcome {
+  try {
+    close(surface);
+    return { releaseLease: true };
+  } catch (error) {
+    // closeSurface already probes the owner after a termination failure and
+    // returns successfully when it can confirm ESRCH. Any thrown result is
+    // therefore live or ambiguous and must retain lineage capacity.
+    return { releaseLease: false, error: error instanceof Error ? error : new Error(String(error)) };
+  }
+}
 
 async function bindLineageLaunchToSurface(
   context: LineageContext,
@@ -713,9 +730,15 @@ async function bindLineageLaunchToSurface(
       throw new Error("The lineage launch lease disappeared before process ownership was recorded");
     }
   } catch (error) {
-    try { closeSurface(surface); } catch {}
-    // The process was already spawned, so this launch remains charged.
-    await releaseLineageLaunch(context.file, id, token).catch(() => false);
+    const closeOutcome = closeSurfaceForLineage(surface);
+    // The process was already spawned, so this launch remains charged. Release
+    // active capacity only after closeSurface confirms termination.
+    if (closeOutcome.releaseLease) {
+      await releaseLineageLaunch(context.file, id, token).catch(() => false);
+    }
+    if (closeOutcome.error) {
+      throw new AggregateError([error, closeOutcome.error], "Failed to bind lineage ownership and terminate the spawned process");
+    }
     throw error;
   }
 }
@@ -834,6 +857,7 @@ interface RunningSubagent {
   lineageFile?: string;
   lineageToken?: string;
   lineageHeartbeatAt?: number;
+  lineageHeartbeatDiagnosticAt?: number;
 }
 
 /** Directly owned running subagents, keyed by stable descendant id. */
@@ -880,9 +904,10 @@ function activeLineageAgents(): RunningSubagent[] {
   return agents.sort((a, b) => a.depth - b.depth || a.startTime - b.startTime || a.id.localeCompare(b.id));
 }
 
-function viewerSnapshotFile(id: string): string | null {
-  if (!latestLineageFile) return null;
-  return join(dirname(latestLineageFile), "subagent-viewers", `${id}.json`);
+function viewerSnapshotFile(agent: RunningSubagent): string | null {
+  const lineageFile = agent.lineageFile ?? latestLineageFile;
+  if (!lineageFile) return null;
+  return join(dirname(lineageFile), "subagent-viewers", `${agent.id}.json`);
 }
 
 function observableEventsFor(agent: RunningSubagent, limit: number): SubagentMonitorEvent[] {
@@ -902,21 +927,29 @@ function observableEventsFor(agent: RunningSubagent, limit: number): SubagentMon
   }];
 }
 
-function refreshViewerSnapshot(agent: RunningSubagent): string | null {
-  const file = viewerSnapshotFile(agent.id);
+function writeAgentViewerSnapshot(
+  agent: RunningSubagent,
+  options: { status?: string; terminal?: boolean; events?: SubagentMonitorEvent[] } = {},
+): string | null {
+  const file = viewerSnapshotFile(agent);
   if (!file) return null;
-  const snapshot = classifyStatus(agent.statusState, Date.now());
+  const status = options.status ?? formatWidgetRightLabel(classifyStatus(agent.statusState, Date.now())).trim();
   writeViewerSnapshot(file, {
     id: agent.id,
     parentId: agent.parentId,
     name: agent.name,
     agent: agent.agent ?? null,
     depth: agent.depth,
-    status: formatWidgetRightLabel(snapshot).trim(),
+    status,
     elapsed: formatElapsedMMSS(agent.startTime),
-    events: observableEventsFor(agent, 20),
+    terminal: options.terminal,
+    events: options.events ?? observableEventsFor(agent, 20),
   });
   return file;
+}
+
+function refreshViewerSnapshot(agent: RunningSubagent): string | null {
+  return writeAgentViewerSnapshot(agent);
 }
 
 // When this extension is loaded inside a subagent that itself spawns children
@@ -936,6 +969,8 @@ const RUNNING_CHILDREN_COUNT_KEY = Symbol.for("pi-subagents/running-children-cou
 let latestCtx: ExtensionContext | null = null;
 /** Latest ExtensionAPI, used to deliver ask_question notifications from the watcher. */
 let latestPi: ExtensionAPI | null = null;
+/** Invalidates asynchronous viewer work when its initiating Pi session retires. */
+let latestUiGeneration = 0;
 
 /** Interval timer for widget re-renders. */
 let widgetInterval: ReturnType<typeof setInterval> | null = null;
@@ -1024,8 +1059,17 @@ function borderBottom(width: number): string {
   return `${ACCENT}╰${"─".repeat(inner)}╯${RST}`;
 }
 
+function activeChildCounts(agents: RunningSubagent[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const agent of agents) {
+    if (agent.parentId) counts.set(agent.parentId, (counts.get(agent.parentId) ?? 0) + 1);
+  }
+  return counts;
+}
+
 function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): string[] {
   const count = agents.length;
+  const childCounts = activeChildCounts(agents);
   const title = "Subagents";
   const launchInfo = latestLineageUsage
     ? ` · ${latestLineageUsage.used}/${latestLineageUsage.limit} launches`
@@ -1040,7 +1084,9 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
     const snapshot = classifyStatus(agent.statusState, Date.now());
     const icon = widgetIcon(snapshot.kind);
     const treeIndent = "  ".repeat(Math.max(0, agent.depth - 1));
-    const left = ` ${icon} ${elapsed}  ${treeIndent}${agent.name}${agentTag} [${agent.id}] `;
+    const childCount = childCounts.get(agent.id) ?? 0;
+    const descendants = childCount > 0 ? ` ↳${childCount}` : "";
+    const left = ` ${icon} ${elapsed}  ${treeIndent}${agent.name}${agentTag} [${agent.id}]${descendants} `;
     const right = statusConfig.enabled
       ? formatWidgetRightLabel(snapshot)
       : agent.cli === "claude"
@@ -1089,7 +1135,12 @@ function syncSubagentStatusWidget(
           const id = renderedIds[event.y - 1];
           const agent = id ? getAgents().find((candidate) => candidate.id === id) : undefined;
           if (!agent) return undefined;
-          onRowClick?.(agent);
+          try {
+            onRowClick?.(agent);
+          } catch {
+            // Click handlers schedule their own guarded notification path. A
+            // rendering/input callback must never tear down the fullscreen TUI.
+          }
           return { handled: true };
         },
       };
@@ -1119,14 +1170,29 @@ function updateWidget() {
     () => flattenMonitorTree(activeLineageAgents()),
     (agent) => {
       const ctx = latestCtx;
+      const generation = latestUiGeneration;
       if (!ctx) return;
-      const snapshotFile = refreshViewerSnapshot(agent);
-      if (runtimeConfig.herdrViewer.enabled && herdrViewer.available() && snapshotFile) {
-        void herdrViewer.openOrFocus({ id: agent.id, name: agent.name, snapshotFile })
-          .catch((error) => ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"));
-        return;
-      }
-      void showSubagentLog(ctx, `${agent.name} [${agent.id}]`, agent.sessionFile);
+      const isCurrent = () => latestCtx === ctx && latestUiGeneration === generation;
+      // Defer all filesystem and Herdr work out of the TUI mouse callback so a
+      // synchronous snapshot error cannot unwind Pi's fullscreen input loop.
+      void Promise.resolve().then(async () => {
+        if (!isCurrent()) return;
+        const snapshotFile = refreshViewerSnapshot(agent);
+        if (!isCurrent()) return;
+        if (runtimeConfig.herdrViewer.enabled && herdrViewer.available() && snapshotFile) {
+          await herdrViewer.openOrFocus({
+            id: agent.id,
+            name: agent.name,
+            snapshotFile,
+            callerCwd: ctx.cwd,
+            isCurrent,
+          });
+          return;
+        }
+        await showOwnedSubagentSnapshot(ctx, agent);
+      }).catch((error) => {
+        if (isCurrent()) ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      });
     },
   );
 
@@ -1226,6 +1292,7 @@ function renderSubagentMonitorLines(
   expandedIds?: ReadonlySet<string>,
 ): string[] {
   const agents = flattenMonitorTree(allAgents, expandedIds);
+  const childCounts = activeChildCounts(allAgents);
   const lines = [monitorBorder("top", width, theme)];
   lines.push(monitorRow(
     ` ${theme.fg("accent", theme.bold("Subagents"))} ${theme.fg("dim", `· ${allAgents.length} active`)}`,
@@ -1254,8 +1321,10 @@ function renderSubagentMonitorLines(
     const treeMarker = hasChildren ? (expandedIds?.has(agent.id) === false ? "▶" : "▼") : "·";
     const indent = "  ".repeat(Math.max(0, agent.depth - 1));
     const role = agent.agent ? theme.fg("dim", ` (${agent.agent})`) : "";
+    const childCount = childCounts.get(agent.id) ?? 0;
+    const descendants = childCount > 0 ? ` ↳${childCount}` : "";
     lines.push(monitorRow(
-      ` ${selectedMarker} ${indent}${treeMarker} ${theme.fg(selected ? "accent" : "text", agent.name)}${role} ${theme.fg("dim", `[${agent.id}] · ${status}`)}`,
+      ` ${selectedMarker} ${indent}${treeMarker} ${theme.fg(selected ? "accent" : "text", agent.name)}${role} ${theme.fg("dim", `[${agent.id}]${descendants} · ${status}`)}`,
       width,
       theme,
     ));
@@ -1385,6 +1454,54 @@ function renderSubagentLogLines(
   lines.push(monitorRow(` ${theme.fg("dim", "Esc closes this view")}`, width, theme));
   lines.push(monitorBorder("bottom", width, theme));
   return lines;
+}
+
+async function showOwnedSubagentSnapshot(
+  ctx: ExtensionContext,
+  agent: RunningSubagent,
+): Promise<void> {
+  if (ctx.mode !== "tui") {
+    ctx.ui.notify("Subagent snapshots are available in interactive TUI mode.", "warning");
+    return;
+  }
+  // Capture only the same bounded, ownership-aware events used by the external
+  // viewer. In particular, a synthetic lineage descendant never causes the
+  // root process to browse that descendant's arbitrary session path.
+  const events = observableEventsFor(agent, 16);
+  const status = formatWidgetRightLabel(classifyStatus(agent.statusState, Date.now())).trim();
+  await ctx.ui.custom<void>((_tui, theme, _keybindings, done) => ({
+    render(width: number) {
+      const lines = [monitorBorder("top", width, theme)];
+      lines.push(monitorRow(
+        ` ${theme.fg("accent", theme.bold(`Owned snapshot · ${agent.name} [${agent.id}]`))}`,
+        width,
+        theme,
+      ));
+      lines.push(monitorRow(` ${theme.fg("dim", `depth ${agent.depth} · ${status}`)}`, width, theme));
+      lines.push(monitorBorder("divider", width, theme));
+      if (events.length === 0) {
+        lines.push(monitorRow(` ${theme.fg("muted", "No bounded observable events found.")}`, width, theme));
+      } else {
+        for (const event of events) lines.push(monitorRow(monitorEventText(event, theme), width, theme));
+      }
+      lines.push(monitorRow(` ${theme.fg("dim", "Esc closes this view")}`, width, theme));
+      lines.push(monitorBorder("bottom", width, theme));
+      return lines;
+    },
+    handleInput(data: string) {
+      if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) done();
+    },
+    invalidate() {},
+  }), {
+    overlay: true,
+    overlayOptions: {
+      width: "85%",
+      minWidth: 50,
+      maxHeight: "85%",
+      anchor: "center",
+      margin: 1,
+    },
+  });
 }
 
 async function showSubagentLog(
@@ -1912,6 +2029,11 @@ export const __test__ = {
   parseStructuredHandoff,
   activeLineageAgents,
   refreshViewerSnapshot,
+  writeAgentViewerSnapshot,
+  observableEventsFor,
+  activeChildCounts,
+  closeSurfaceForLineage,
+  watchSubagent,
 };
 
 function canDeliverToSession(
@@ -2365,11 +2487,42 @@ function deliverPendingQuestion(running: RunningSubagent): void {
   } catch {}
 }
 
+function reportLineageHeartbeatFailure(running: RunningSubagent, error: unknown): void {
+  const now = Date.now();
+  if (now - (running.lineageHeartbeatDiagnosticAt ?? 0) < 60_000) return;
+  running.lineageHeartbeatDiagnosticAt = now;
+  const detail = sanitizeMonitorText(error instanceof Error ? error.message : String(error), 240) || "unknown error";
+  const message = `Subagent ${running.id} lineage heartbeat failed; capacity is retained fail-closed. Check ${running.lineageFile}: ${detail}`;
+  try { console.error(message); } catch {}
+  if (runningSubagents.get(running.id) === running) {
+    try { latestCtx?.ui.notify(message, "warning"); } catch {}
+  }
+}
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
+  let releaseLineageLease = true;
+  const closeForWatcher = () => {
+    const outcome = closeSurfaceForLineage(surface);
+    releaseLineageLease = outcome.releaseLease;
+    if (outcome.error) throw outcome.error;
+  };
+  let terminalSnapshot: { status: string; events: SubagentMonitorEvent[]; terminal: boolean } | null = null;
+  const persistTerminalSnapshot = (status: string, replace = false, terminal = true) => {
+    if (!terminalSnapshot || replace) {
+      terminalSnapshot = { status, events: observableEventsFor(running, 20), terminal };
+    }
+    try {
+      writeAgentViewerSnapshot(running, {
+        status: terminalSnapshot.status,
+        terminal: terminalSnapshot.terminal,
+        events: terminalSnapshot.events,
+      });
+    } catch {}
+  };
 
   try {
     const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
@@ -2386,12 +2539,21 @@ async function watchSubagent(
           now - (running.lineageHeartbeatAt ?? 0) >= 5_000
         ) {
           running.lineageHeartbeatAt = now;
-          void touchLineageLaunch(running.lineageFile, running.id, running.lineageToken, now);
+          void touchLineageLaunch(running.lineageFile, running.id, running.lineageToken, now)
+            .then((touched) => {
+              if (!touched) throw new Error("active lease token no longer matches");
+            })
+            .catch((error) => reportLineageHeartbeatFailure(running, error));
         }
       },
     });
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    persistTerminalSnapshot(
+      result.errorMessage || result.exitCode !== 0
+        ? `failed · exit ${result.exitCode}`
+        : "completed",
+    );
 
     if (running.cli === "claude") {
       // Claude Code result extraction
@@ -2423,7 +2585,7 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      closeSurface(surface);
+      closeForWatcher();
       runningSubagents.delete(running.id);
 
       return {
@@ -2459,7 +2621,7 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    closeSurface(surface);
+    closeForWatcher();
     runningSubagents.delete(running.id);
 
     return {
@@ -2479,9 +2641,16 @@ async function watchSubagent(
     };
   } catch (err: any) {
     try {
-      closeSurface(surface);
+      closeForWatcher();
     } catch {}
-    runningSubagents.delete(running.id);
+    persistTerminalSnapshot(
+      releaseLineageLease
+        ? signal.aborted ? "cancelled" : "disconnected · watcher error"
+        : "termination failed · owner may still be active",
+      !releaseLineageLease,
+      releaseLineageLease,
+    );
+    if (releaseLineageLease) runningSubagents.delete(running.id);
 
     if (signal.aborted) {
       return {
@@ -2511,9 +2680,15 @@ async function watchSubagent(
       }),
     };
   } finally {
-    if (running.lineageFile && running.lineageToken) {
+    // Write before releasing ownership, as well as after, so both the active→
+    // terminal transition and any cross-process refresh race converge on the
+    // terminal snapshot. A hard parent crash is shown as stale/disconnected by
+    // viewer-runtime once updatedAt stops advancing.
+    persistTerminalSnapshot("disconnected");
+    if (releaseLineageLease && running.lineageFile && running.lineageToken) {
       await releaseLineageLaunch(running.lineageFile, running.id, running.lineageToken).catch(() => false);
     }
+    persistTerminalSnapshot("disconnected");
   }
 }
 
@@ -2524,6 +2699,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // Capture the UI context for widget updates
   pi.on("session_start", async (_event, ctx) => {
     sessionGeneration += 1;
+    latestUiGeneration += 1;
     sessionActive = true;
     latestPi = pi;
     latestCtx = ctx;
@@ -2546,6 +2722,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", async (_event, _ctx) => {
     sessionActive = false;
     sessionGeneration += 1;
+    latestUiGeneration += 1;
     if (latestPi === pi) latestPi = null;
     latestCtx = null;
     subagentWidgetRegistration.installed = false;
@@ -2567,14 +2744,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     const lineageReleases: Array<Promise<boolean>> = [];
     for (const [_id, agent] of runningSubagents) {
       try {
-        closeSurface(agent.surface);
-      } catch (error) {
-        closeErrors.push(error instanceof Error ? error : new Error(String(error)));
-      } finally {
-        agent.abortController?.abort();
-        if (agent.lineageFile && agent.lineageToken) {
-          lineageReleases.push(releaseLineageLaunch(agent.lineageFile, agent.id, agent.lineageToken));
-        }
+        writeAgentViewerSnapshot(agent, { status: "parent session retiring", terminal: false });
+      } catch {}
+      const closeOutcome = closeSurfaceForLineage(agent.surface);
+      try {
+        writeAgentViewerSnapshot(agent, {
+          status: closeOutcome.releaseLease
+            ? "cancelled · parent session retired"
+            : "termination failed · owner may still be active",
+          terminal: closeOutcome.releaseLease,
+        });
+      } catch {}
+      if (closeOutcome.error) closeErrors.push(closeOutcome.error);
+      agent.abortController?.abort();
+      if (closeOutcome.releaseLease && agent.lineageFile && agent.lineageToken) {
+        lineageReleases.push(releaseLineageLaunch(agent.lineageFile, agent.id, agent.lineageToken));
       }
     }
     await Promise.allSettled(lineageReleases);
@@ -2821,9 +3005,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           });
         } catch (error) {
           runningSubagents.delete(running.id);
-          try { closeSurface(running.surface); } catch {}
-          if (running.lineageFile && running.lineageToken) {
+          const closeOutcome = closeSurfaceForLineage(running.surface);
+          if (closeOutcome.releaseLease && running.lineageFile && running.lineageToken) {
             await releaseLineageLaunch(running.lineageFile, running.id, running.lineageToken).catch(() => false);
+          }
+          if (closeOutcome.error) {
+            throw new AggregateError([error, closeOutcome.error], "Failed to register and terminate spawned subagent");
           }
           throw error;
         }

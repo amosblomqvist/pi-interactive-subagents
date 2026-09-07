@@ -1,13 +1,15 @@
 import {
+  closeSync,
   existsSync,
+  fstatSync,
   mkdirSync,
-  readFileSync,
+  openSync,
+  readSync,
   renameSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { sanitizeMonitorText } from "./monitor.ts";
 
@@ -42,6 +44,8 @@ export interface LineageDescendantRecord {
 export interface ActiveLineageRecord extends LineageDescendantRecord {
   token: string;
   ownerPid: number;
+  /** OS process-start identity when the platform exposes one; null is conservative PID-only tracking. */
+  ownerInstance: string | null;
   heartbeatAt: number;
   kind: LineageLaunchKind;
 }
@@ -79,16 +83,35 @@ export interface LineageLease {
   launchesUsed: number;
 }
 
-const LOCK_STALE_MS = 30_000;
-const LOCK_WAIT_MS = 5_000;
+const LOCK_WAIT_MS = 1_000;
 const ABANDONED_ACTIVE_MS = 15_000;
 const MAX_RECORDS = 10_000;
 const MAX_LEDGER_BYTES = 64 * 1024 * 1024;
-const MAX_ID_LENGTH = 200;
 const MAX_PATH_LENGTH = 32_768;
+const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$/u;
+
+export function isSafeLineageId(value: unknown): value is string {
+  return typeof value === "string" && SAFE_ID.test(value);
+}
 
 function boundedString(value: unknown, maxLength: number): value is string {
   return typeof value === "string" && value.length <= maxLength;
+}
+
+function readBoundedText(file: string, maxBytes: number): string | null {
+  let fd: number | undefined;
+  try {
+    fd = openSync(file, "r");
+    const size = fstatSync(fd).size;
+    if (size < 1 || size > maxBytes) return null;
+    const buffer = Buffer.alloc(size);
+    const bytesRead = readSync(fd, buffer, 0, size, 0);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } catch {
+    return null;
+  } finally {
+    if (fd != null) closeSync(fd);
+  }
 }
 
 function validLimit(value: unknown): value is number {
@@ -119,25 +142,31 @@ function asObject(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function validDescendant(value: unknown, id: string, active: boolean): boolean {
+function expectedActivityFile(ledgerFile: string, id: string): string {
+  return resolve(dirname(ledgerFile), "subagent-activity", `${id}.json`);
+}
+
+function validDescendant(value: unknown, id: string, active: boolean, ledgerFile: string): boolean {
   const record = asObject(value);
-  if (!record || !boundedString(id, MAX_ID_LENGTH) || record.id !== id) return false;
-  if (record.parentId !== null && !boundedString(record.parentId, MAX_ID_LENGTH)) return false;
+  if (!record || !isSafeLineageId(id) || record.id !== id) return false;
+  if (record.parentId !== null && !isSafeLineageId(record.parentId)) return false;
   if (!boundedString(record.name, 100) || !boundedString(record.task, 300)) return false;
   if (!boundedString(record.sessionFile, MAX_PATH_LENGTH) || !boundedString(record.activityFile, MAX_PATH_LENGTH)) return false;
+  if (resolve(record.activityFile) !== expectedActivityFile(ledgerFile, id)) return false;
   if (record.agent !== null && !boundedString(record.agent, 100)) return false;
-  if (!validLimit(record.depth) || !validLimit(record.launches)) return false;
+  if (!validLimit(record.depth) || !validLimit(record.launches) || (record.launches as number) < 1) return false;
   if (!Number.isFinite(record.firstLaunchedAt) || !Number.isFinite(record.lastLaunchedAt)) return false;
   if (!active) return true;
   return boundedString(record.token, 128) && record.token.length > 0 &&
     Number.isInteger(record.ownerPid) && (record.ownerPid as number) > 0 &&
+    (record.ownerInstance === null || boundedString(record.ownerInstance, 200)) &&
     Number.isFinite(record.heartbeatAt) &&
     (record.kind === "launch" || record.kind === "resume");
 }
 
-function normalizeLedger(value: unknown): LineageLedger | null {
+function normalizeLedger(value: unknown, ledgerFile: string): LineageLedger | null {
   const input = asObject(value);
-  if (!input || input.version !== 1 || typeof input.lineageId !== "string") return null;
+  if (!input || input.version !== 1 || !isSafeLineageId(input.lineageId)) return null;
   let limits: DelegationLimits;
   try {
     limits = validateDelegationLimits(input.limits);
@@ -149,17 +178,46 @@ function normalizeLedger(value: unknown): LineageLedger | null {
   const active = asObject(input.active);
   if (!descendants || !active) return null;
   if (Object.keys(descendants).length > MAX_RECORDS || Object.keys(active).length > MAX_RECORDS) return null;
-  for (const [id, record] of Object.entries(descendants)) if (!validDescendant(record, id, false)) return null;
-  for (const [id, record] of Object.entries(active)) if (!validDescendant(record, id, true)) return null;
-  return { ...input, limits, descendants, active } as unknown as LineageLedger;
+  for (const [id, record] of Object.entries(descendants)) if (!validDescendant(record, id, false, ledgerFile)) return null;
+  for (const [id, record] of Object.entries(active)) if (!validDescendant(record, id, true, ledgerFile)) return null;
+
+  const descendantRecords = descendants as unknown as Record<string, LineageDescendantRecord>;
+  const activeRecords = active as unknown as Record<string, ActiveLineageRecord>;
+  let launchTotal = 0;
+  for (const record of Object.values(descendantRecords)) {
+    launchTotal += record.launches;
+    const parent = record.parentId ? descendantRecords[record.parentId] : null;
+    if (record.parentId && !parent) return null;
+    if (record.depth !== (parent ? parent.depth + 1 : 1)) return null;
+  }
+  if (launchTotal !== input.launchesUsed) return null;
+  for (const [id, record] of Object.entries(activeRecords)) {
+    const persisted = descendantRecords[id];
+    if (!persisted) return null;
+    for (const field of [
+      "id", "parentId", "name", "agent", "depth", "sessionFile", "activityFile",
+      "task", "firstLaunchedAt", "lastLaunchedAt", "launches",
+    ] as const) {
+      if (record[field] !== persisted[field]) return null;
+    }
+  }
+  return { ...input, limits, descendants: descendantRecords, active: activeRecords } as unknown as LineageLedger;
 }
 
 export function readLineageLedger(file: string): LineageLedger | null {
+  if (!existsSync(file)) return null;
+  let fd: number | undefined;
   try {
-    if (!existsSync(file) || statSync(file).size > MAX_LEDGER_BYTES) return null;
-    return normalizeLedger(JSON.parse(readFileSync(file, "utf8")));
+    fd = openSync(file, "r");
+    const size = fstatSync(fd).size;
+    if (size < 1 || size > MAX_LEDGER_BYTES) return null;
+    const buffer = Buffer.alloc(size);
+    const bytesRead = readSync(fd, buffer, 0, size, 0);
+    return normalizeLedger(JSON.parse(buffer.subarray(0, bytesRead).toString("utf8")), file);
   } catch {
     return null;
+  } finally {
+    if (fd != null) closeSync(fd);
   }
 }
 
@@ -189,39 +247,68 @@ function processAlive(pid: number): boolean {
   }
 }
 
-function lockIsStale(lockDir: string, now: number): boolean {
+/** Linux exposes a stable process-start tick that disambiguates PID reuse. */
+export function getProcessInstanceId(pid: number): string | null {
+  if (process.platform !== "linux" || !Number.isInteger(pid) || pid <= 0) return null;
   try {
-    return now - statSync(lockDir).mtimeMs >= LOCK_STALE_MS;
+    const stat = readBoundedText(`/proc/${pid}/stat`, 16 * 1024);
+    if (!stat) return null;
+    const closingParen = stat.lastIndexOf(")");
+    if (closingParen < 0) return null;
+    const fieldsFromState = stat.slice(closingParen + 2).trim().split(/\s+/u);
+    const startTicks = fieldsFromState[19];
+    return startTicks ? `linux-start:${startTicks}` : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
 async function acquireLock(file: string): Promise<() => void> {
   const lockDir = `${file}.lock`;
+  const ownerFile = `${lockDir}/owner.json`;
   const deadline = Date.now() + LOCK_WAIT_MS;
+  const token = randomBytes(16).toString("hex");
   mkdirSync(dirname(file), { recursive: true });
   for (;;) {
     try {
       mkdirSync(lockDir);
-      writeFileSync(`${lockDir}/owner.json`, JSON.stringify({ pid: process.pid, at: Date.now() }), "utf8");
-      let released = false;
-      return () => {
-        if (released) return;
-        released = true;
-        rmSync(lockDir, { recursive: true, force: true });
-      };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (lockIsStale(lockDir, Date.now())) {
-        try { rmSync(lockDir, { recursive: true, force: true }); } catch {}
-        continue;
-      }
       if (Date.now() >= deadline) {
-        throw new Error(`Timed out acquiring subagent lineage lock: ${file}`);
+        let owner = "unknown";
+        try {
+          const parsed = JSON.parse(readBoundedText(ownerFile, 4 * 1024) ?? "null");
+          owner = sanitizeMonitorText(`pid=${parsed?.pid ?? "unknown"} at=${parsed?.at ?? "unknown"}`, 120) || "unknown";
+        } catch {}
+        throw new Error(
+          `Timed out acquiring subagent lineage lock: ${file}. Lock owner: ${owner}. ` +
+          "Automatic stale-lock deletion is disabled to prevent deleting a replacement lock. " +
+          "After confirming every owning Pi process has stopped, remove the .lock directory manually.",
+        );
       }
       await new Promise((resolve) => setTimeout(resolve, 15));
+      continue;
     }
+
+    try {
+      writeFileSync(ownerFile, JSON.stringify({ token, pid: process.pid, at: Date.now() }), { encoding: "utf8", flag: "wx" });
+    } catch (error) {
+      // This process just created the directory and no peer can acquire it.
+      try { rmSync(lockDir, { recursive: true, force: true }); } catch {}
+      throw error;
+    }
+
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      let currentToken: unknown;
+      try { currentToken = JSON.parse(readBoundedText(ownerFile, 4 * 1024) ?? "null")?.token; } catch { return; }
+      if (currentToken !== token) return;
+      // No automatic reclaimer exists, so another library process cannot
+      // replace this directory between token verification and removal.
+      rmSync(lockDir, { recursive: true, force: true });
+    };
   }
 }
 
@@ -254,10 +341,14 @@ export async function ensureLineageLedger(
   options: { allowLimitUpdate: boolean },
 ): Promise<LineageLedger> {
   const validated = validateDelegationLimits(limits);
+  if (!isSafeLineageId(lineageId)) throw new Error(`Unsafe subagent lineage id: ${sanitizeMonitorText(lineageId, 200)}`);
   return withLedger(file, (existing) => {
     const now = Date.now();
     if (!existing && existsSync(file)) {
       throw new Error(`Subagent lineage ledger is invalid; refusing to reset launch accounting: ${file}`);
+    }
+    if (!existing && !options.allowLimitUpdate) {
+      throw new Error(`Inherited subagent lineage ledger is missing; refusing to recreate zeroed accounting: ${file}`);
     }
     if (existing && existing.lineageId !== lineageId) {
       throw new Error(`Subagent lineage file belongs to ${existing.lineageId}, not ${lineageId}`);
@@ -274,7 +365,14 @@ function reconcileAbandoned(ledger: LineageLedger, now: number): boolean {
   let changed = false;
   for (const [id, record] of Object.entries(ledger.active)) {
     if (now - record.heartbeatAt < ABANDONED_ACTIVE_MS) continue;
-    if (processAlive(record.ownerPid)) continue;
+    if (processAlive(record.ownerPid)) {
+      const currentInstance = getProcessInstanceId(record.ownerPid);
+      if (!record.ownerInstance || !currentInstance || currentInstance === record.ownerInstance) {
+        // Platforms without a process-start identity retain ambiguous capacity
+        // rather than falsely treating a reused PID as the original owner.
+        continue;
+      }
+    }
     delete ledger.active[id];
     changed = true;
   }
@@ -298,10 +396,13 @@ export async function reserveLineageLaunch(
   file: string,
   request: LineageLaunchRequest,
 ): Promise<LineageLease> {
-  if (!boundedString(request.id, MAX_ID_LENGTH) || !request.id) throw new Error("Subagent lineage id is invalid or too long");
-  if (request.parentId !== null && !boundedString(request.parentId, MAX_ID_LENGTH)) throw new Error("Subagent lineage parent id is invalid or too long");
+  if (!isSafeLineageId(request.id)) throw new Error("Subagent lineage id must contain only safe identifier characters");
+  if (request.parentId !== null && !isSafeLineageId(request.parentId)) throw new Error("Subagent lineage parent id must contain only safe identifier characters");
   if (!boundedString(request.sessionFile, MAX_PATH_LENGTH) || !boundedString(request.activityFile, MAX_PATH_LENGTH)) {
     throw new Error("Subagent lineage artifact path is invalid or too long");
+  }
+  if (resolve(request.activityFile) !== expectedActivityFile(file, request.id)) {
+    throw new Error("Subagent activity path escapes its owned lineage artifact directory");
   }
   if (!validLimit(request.depth)) throw new Error("Subagent lineage depth is invalid");
   if (!Number.isSafeInteger(request.ownerPid) || request.ownerPid <= 0) throw new Error("Subagent lineage owner process is invalid");
@@ -334,7 +435,8 @@ export async function reserveLineageLaunch(
     if (activeCount >= ledger.limits.maxConcurrentDescendants) {
       throw new Error(
         `Subagent concurrent descendant limit reached (${ledger.limits.maxConcurrentDescendants} active across this root lineage). ` +
-        "Wait for or cancel an active descendant before launching another.",
+        "Wait for or cancel an active descendant before launching another. Stale owners are reclaimed only after confirmed process death; " +
+        "platforms without process-start identity conservatively retain an apparently live PID to avoid a PID-reuse race.",
       );
     }
     if (ledger.launchesUsed >= ledger.limits.maxLaunchesPerLineage) {
@@ -363,6 +465,7 @@ export async function reserveLineageLaunch(
       ...descendant,
       token,
       ownerPid: request.ownerPid,
+      ownerInstance: getProcessInstanceId(request.ownerPid),
       heartbeatAt: now,
       kind: request.kind,
     };
@@ -411,6 +514,7 @@ export async function setLineageLaunchOwner(
     const record = ledger?.active[id];
     if (!ledger || !record || record.token !== token) return false;
     record.ownerPid = ownerPid;
+    record.ownerInstance = getProcessInstanceId(ownerPid);
     record.heartbeatAt = heartbeatAt;
     ledger.updatedAt = heartbeatAt;
     writeLedger(file, ledger);

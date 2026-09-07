@@ -1,6 +1,6 @@
-import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readSubagentsConfigSource } from "./config-source.ts";
 
 export const SNAPSHOT_STALLED_AFTER_MS = 60_000;
 export const DEFAULT_STATUS_LINE_LIMIT = 4;
@@ -149,32 +149,18 @@ export function parseStatusConfig(rawConfig: unknown, source = "config.json"): S
   };
 }
 
-function readStatusConfigFile(configPath: string, examplePath: string): { sourcePath: string; rawConfig: string } {
-  try {
-    return { sourcePath: configPath, rawConfig: readFileSync(configPath, "utf8") };
-  } catch (error) {
-    const errno = error as NodeJS.ErrnoException;
-    if (errno.code !== "ENOENT") throw error;
-  }
-
-  try {
-    return { sourcePath: examplePath, rawConfig: readFileSync(examplePath, "utf8") };
-  } catch (error) {
-    const errno = error as NodeJS.ErrnoException;
-    if (errno.code === "ENOENT") {
-      throw new Error(
-        `Missing subagent status config. Expected ${configPath} or ${examplePath}.`,
-      );
-    }
-    throw error;
-  }
-}
-
 export function loadStatusConfig(
   configPath = DEFAULT_STATUS_CONFIG_PATH,
   examplePath = STATUS_CONFIG_EXAMPLE_PATH,
+  env: NodeJS.ProcessEnv = process.env,
 ): StatusConfig {
-  const { sourcePath, rawConfig } = readStatusConfigFile(configPath, examplePath);
+  const { sourcePath, rawConfig } = readSubagentsConfigSource({
+    configPath,
+    examplePath,
+    env,
+    honorExternal: configPath === DEFAULT_STATUS_CONFIG_PATH && examplePath === STATUS_CONFIG_EXAMPLE_PATH,
+    missingLabel: "subagent status config",
+  });
 
   let parsed: unknown;
   try {
