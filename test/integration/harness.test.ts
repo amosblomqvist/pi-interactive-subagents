@@ -14,6 +14,7 @@ import {
   cleanupTestEnv,
   createExtensionDriver,
   createTestEnv,
+  isSubagentEnvironmentKey,
   restoreSubagentEnvironment,
   stageExplicitPiConfigFiles,
   stripSubagentEnvironment,
@@ -130,42 +131,49 @@ test("rejects non-file config selections before a child can start", () => {
   }
 });
 
-test("strips and restores every PI_SUBAGENT_* casing variant", () => {
+test("strips and restores PI_SUBAGENT_* plus plural config in every casing", () => {
   const environment: NodeJS.ProcessEnv = {
     PATH: "kept",
     PI_SUBAGENT_ALLOWED: "scout",
     Pi_SubAgent_Name: "mixed",
     pi_subagent_future_flag: "future",
+    PI_SUBAGENTS_CONFIG: "C:\\executor\\config.json",
+    pi_subagents_config: "C:\\executor\\lower-config.json",
   };
 
   const snapshot = stripSubagentEnvironment(environment);
   assert.deepEqual(environment, { PATH: "kept" });
 
   environment.pI_sUbAgEnT_new_contamination = "remove-me";
+  environment.Pi_SubAgents_Config = "remove-config-too";
   restoreSubagentEnvironment(environment, snapshot);
   assert.equal(environment.PATH, "kept");
   assert.equal(environment.PI_SUBAGENT_ALLOWED, "scout");
   assert.equal(environment.Pi_SubAgent_Name, "mixed");
   assert.equal(environment.pi_subagent_future_flag, "future");
+  assert.equal(environment.PI_SUBAGENTS_CONFIG, "C:\\executor\\config.json");
+  assert.equal(environment.pi_subagents_config, "C:\\executor\\lower-config.json");
   assert.equal(environment.pI_sUbAgEnT_new_contamination, undefined);
+  assert.equal(environment.Pi_SubAgents_Config, undefined);
 });
 
 test("synthetic parent driver filters inherited/future subagent contamination and restores it", async () => {
   const before = Object.entries(process.env)
-    .filter(([key]) => key.toUpperCase().startsWith("PI_SUBAGENT_"))
+    .filter(([key]) => isSubagentEnvironmentKey(key))
     .sort(([left], [right]) => left.localeCompare(right));
   const env = createTestEnv();
   const driver = await createExtensionDriver(env);
 
   assert.deepEqual(
-    Object.keys(process.env).filter((key) => key.toUpperCase().startsWith("PI_SUBAGENT_")),
+    Object.keys(process.env).filter((key) => isSubagentEnvironmentKey(key)),
     [],
   );
   process.env.Pi_SubAgent_Future_Contamination = "remove-on-restore";
+  process.env.Pi_SubAgents_Config = "remove-config-on-restore";
   await driver.stop();
 
   const after = Object.entries(process.env)
-    .filter(([key]) => key.toUpperCase().startsWith("PI_SUBAGENT_"))
+    .filter(([key]) => isSubagentEnvironmentKey(key))
     .sort(([left], [right]) => left.localeCompare(right));
   assert.deepEqual(after, before);
 });

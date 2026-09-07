@@ -132,12 +132,13 @@ type CleanupOperations = {
   removeRoot?: (root: string) => void;
 };
 
-/** Case-insensitive PI_SUBAGENT_* test used for synthetic-parent isolation. */
+/** Case-insensitive subagent runtime/config key test for synthetic-parent isolation. */
 export function isSubagentEnvironmentKey(key: string): boolean {
-  return key.toUpperCase().startsWith("PI_SUBAGENT_");
+  const upper = key.toUpperCase();
+  return upper.startsWith("PI_SUBAGENT_") || upper === "PI_SUBAGENTS_CONFIG";
 }
 
-/** Remove every inherited PI_SUBAGENT_* variable and retain an exact snapshot. */
+/** Remove inherited subagent runtime/config variables and retain an exact snapshot. */
 export function stripSubagentEnvironment(
   environment: NodeJS.ProcessEnv,
 ): Array<[string, string]> {
@@ -151,7 +152,7 @@ export function stripSubagentEnvironment(
   return snapshot;
 }
 
-/** Remove any new contamination, then restore the pre-driver snapshot. */
+/** Remove any new runtime/config contamination, then restore the exact snapshot. */
 export function restoreSubagentEnvironment(
   environment: NodeJS.ProcessEnv,
   snapshot: Array<[string, string]>,
@@ -289,7 +290,9 @@ export async function createExtensionDriver(env: TestEnv): Promise<ExtensionDriv
   process.env.PI_CODING_AGENT_DIR = env.agentDir;
   // The driver is a synthetic top-level orchestrator even when its test command
   // was launched from a subagent. Match all key casing variants and future
-  // PI_SUBAGENT_* additions rather than maintaining a partial allowlist.
+  // PI_SUBAGENT_* additions plus the plural PI_SUBAGENTS_CONFIG override rather
+  // than maintaining a partial allowlist. Real extension children still
+  // inherit PI_SUBAGENTS_CONFIG normally; only this synthetic root is isolated.
   const previousSubagentEnv = stripSubagentEnvironment(process.env);
   // PI_OFFLINE suppresses Pi startup/update/package traffic only. The explicit
   // live child prompt still calls and consumes the selected model provider.

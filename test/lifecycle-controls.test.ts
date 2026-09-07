@@ -10,6 +10,11 @@ import { descendantProcessIds } from '../pi-extension/subagents/surface.ts';
 import { readSubagentActivityFile } from '../pi-extension/subagents/activity.ts';
 import { createStatusState, observeStatus, classifyStatus, formatStatusLine } from '../pi-extension/subagents/status.ts';
 
+function isIsolatedSubagentKey(key: string): boolean {
+  const upper = key.toUpperCase();
+  return upper.startsWith('PI_SUBAGENT_') || upper === 'PI_SUBAGENTS_CONFIG';
+}
+
 function setup(t: any) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'subagent-wait-reason-'));
   const saved = { ...process.env };
@@ -17,7 +22,7 @@ function setup(t: any) {
   const namesKey = Symbol.for('pi-subagents/running-children-names');
   const savedCount = (globalThis as any)[countKey];
   const savedNames = (globalThis as any)[namesKey];
-  for (const key of Object.keys(process.env)) if (key.startsWith('PI_SUBAGENT_')) delete process.env[key];
+  for (const key of Object.keys(process.env)) if (isIsolatedSubagentKey(key)) delete process.env[key];
   process.env.PI_SUBAGENT_AUTO_EXIT = '1';
   process.env.PI_SUBAGENT_ID = 'fixture';
   process.env.PI_SUBAGENT_SESSION = path.join(dir, 'session.jsonl');
@@ -33,8 +38,8 @@ function setup(t: any) {
   const ctx = { shutdown() { shutdowns++; } };
   t.after(() => {
     events.get('session_shutdown')!({ reason: 'quit' }, ctx);
-    for (const key of Object.keys(process.env)) if (key.startsWith('PI_SUBAGENT_')) delete process.env[key];
-    for (const [key, value] of Object.entries(saved)) if (key.startsWith('PI_SUBAGENT_') && value !== undefined) process.env[key] = value;
+    for (const key of Object.keys(process.env)) if (isIsolatedSubagentKey(key)) delete process.env[key];
+    for (const [key, value] of Object.entries(saved)) if (isIsolatedSubagentKey(key) && value !== undefined) process.env[key] = value;
     (globalThis as any)[countKey] = savedCount;
     (globalThis as any)[namesKey] = savedNames;
     fs.rmSync(dir, { recursive: true, force: true });
