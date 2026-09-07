@@ -158,6 +158,12 @@ export interface NameRegistryEntry {
   sessionFile: string;
   /** Canonical session header id (kept for display/lineage). */
   sessionId: string | null;
+  /** Stable descendant identity, reused by resume and viewer/tab routing. */
+  subagentId?: string;
+  /** Technical nesting depth in the root lineage (root session is zero). */
+  depth?: number;
+  /** Stable parent descendant id; null means the root session. */
+  parentId?: string | null;
 }
 
 export type NameRegistry = Record<string, NameRegistryEntry>;

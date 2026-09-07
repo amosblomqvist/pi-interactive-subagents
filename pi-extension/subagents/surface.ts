@@ -108,6 +108,11 @@ export function isBackgroundSurface(surface: string): boolean {
   return surface.startsWith(BACKGROUND_PREFIX);
 }
 
+/** Return the process that owns the background surface, when it has spawned. */
+export function getSurfaceProcessId(surface: string): number | undefined {
+  return backgroundSurfaces.get(surface)?.child?.pid;
+}
+
 export function createBackgroundSurface(): string {
   const surface = `${BACKGROUND_PREFIX}${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
   backgroundSurfaces.set(surface, {});

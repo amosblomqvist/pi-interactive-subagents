@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
-import { Box, Text, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Box, Text, matchesKey, truncateToWidth, visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { dirname, isAbsolute, join, resolve, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -16,6 +16,7 @@ import {
 import { homedir } from "node:os";
 import {
   createSurface,
+  getSurfaceProcessId,
   sendCommand,
   sendLongCommand,
   pollForExit,
@@ -75,6 +76,17 @@ import {
   sanitizeMonitorText,
   type SubagentMonitorEvent,
 } from "./monitor.ts";
+import {
+  ensureLineageLedger,
+  readLineageLedger,
+  reconcileLineageLedger,
+  releaseLineageLaunch,
+  reserveLineageLaunch,
+  setLineageLaunchOwner,
+  touchLineageLaunch,
+} from "./lineage.ts";
+import { loadRuntimeConfig } from "./runtime-config.ts";
+import { HerdrViewerManager, writeViewerSnapshot } from "./herdr-viewer.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -633,7 +645,80 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
   return join(sessionDir, "artifacts", sessionId);
 }
 
+interface LineageContext {
+  file: string;
+  lineageId: string;
+  currentDepth: number;
+  parentId: string | null;
+  inherited: boolean;
+}
+
+async function resolveLineageContext(ctx: {
+  sessionManager: { getSessionId(): string; getSessionDir(): string };
+}): Promise<LineageContext> {
+  const inheritedFile = process.env.PI_SUBAGENT_LINEAGE_FILE?.trim();
+  const inheritedId = process.env.PI_SUBAGENT_LINEAGE_ID?.trim();
+  const rawDepth = process.env.PI_SUBAGENT_DEPTH?.trim();
+  const parsedDepth = rawDepth == null || rawDepth === "" ? 0 : Number(rawDepth);
+  if (!Number.isInteger(parsedDepth) || parsedDepth < 0) {
+    throw new Error(`Invalid PI_SUBAGENT_DEPTH: ${rawDepth}`);
+  }
+
+  const lineageId = inheritedId || ctx.sessionManager.getSessionId();
+  const file = inheritedFile || join(
+    getArtifactDir(ctx.sessionManager.getSessionDir(), lineageId),
+    "subagent-lineage.json",
+  );
+  await ensureLineageLedger(file, lineageId, runtimeConfig.delegation, {
+    // Only a root session may explicitly apply changed configuration. A child
+    // always consumes the limits already pinned by its root lineage.
+    allowLimitUpdate: !inheritedFile,
+  });
+  latestLineageFile = file;
+  return {
+    file,
+    lineageId,
+    currentDepth: parsedDepth,
+    parentId: process.env.PI_SUBAGENT_ID?.trim() || null,
+    inherited: !!inheritedFile,
+  };
+}
+
+function lineageEnvironmentParts(context: LineageContext, childDepth: number): string[] {
+  return [
+    `PI_SUBAGENT_LINEAGE_FILE=${shellEscape(context.file)}`,
+    `PI_SUBAGENT_LINEAGE_ID=${shellEscape(context.lineageId)}`,
+    `PI_SUBAGENT_DEPTH=${shellEscape(String(childDepth))}`,
+  ];
+}
+
 const statusConfig = loadStatusConfig();
+const runtimeConfig = loadRuntimeConfig();
+const HERDR_VIEWER_KEY = Symbol.for("pi-subagents/herdr-viewer-manager");
+const herdrViewer = ((globalThis as any)[HERDR_VIEWER_KEY] as HerdrViewerManager | undefined)
+  ?? new HerdrViewerManager();
+(globalThis as any)[HERDR_VIEWER_KEY] = herdrViewer;
+let latestLineageFile: string | null = null;
+let latestLineageReconcileAt = 0;
+
+async function bindLineageLaunchToSurface(
+  context: LineageContext,
+  id: string,
+  token: string,
+  surface: string,
+): Promise<void> {
+  const ownerPid = getSurfaceProcessId(surface);
+  try {
+    if (!ownerPid || !(await setLineageLaunchOwner(context.file, id, token, ownerPid))) {
+      throw new Error("The lineage launch lease disappeared before process ownership was recorded");
+    }
+  } catch (error) {
+    try { closeSurface(surface); } catch {}
+    // The process was already spawned, so this launch remains charged.
+    await releaseLineageLaunch(context.file, id, token).catch(() => false);
+    throw error;
+  }
+}
 
 function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
   if (snapshot.kind === "starting") return " starting… ";
@@ -717,6 +802,8 @@ interface SubagentResult {
  */
 interface RunningSubagent {
   id: string;
+  parentId: string | null;
+  depth: number;
   name: string;
   task: string;
   agent?: string;
@@ -744,10 +831,93 @@ interface RunningSubagent {
    * long-running agents that are supervised through explicit messages.
    */
   interactive: boolean;
+  lineageFile?: string;
+  lineageToken?: string;
+  lineageHeartbeatAt?: number;
 }
 
-/** All currently running subagents, keyed by id. */
+/** Directly owned running subagents, keyed by stable descendant id. */
 const runningSubagents = new Map<string, RunningSubagent>();
+const lineageStatusStates = new Map<string, SubagentStatusState>();
+let latestLineageUsage: { used: number; limit: number } | null = null;
+
+function activeLineageAgents(): RunningSubagent[] {
+  const ledger = latestLineageFile ? readLineageLedger(latestLineageFile) : null;
+  if (!ledger) return Array.from(runningSubagents.values());
+  latestLineageUsage = { used: ledger.launchesUsed, limit: ledger.limits.maxLaunchesPerLineage };
+  const active = Object.values(ledger.active);
+  const ids = new Set(active.map((record) => record.id));
+  for (const id of lineageStatusStates.keys()) if (!ids.has(id)) lineageStatusStates.delete(id);
+
+  const agents = active.map((record): RunningSubagent => {
+    const direct = runningSubagents.get(record.id);
+    if (direct) return direct;
+    let statusState = lineageStatusStates.get(record.id);
+    if (!statusState) {
+      statusState = createStatusState({ source: "pi", startTimeMs: record.lastLaunchedAt });
+      lineageStatusStates.set(record.id, statusState);
+    }
+    const synthetic: RunningSubagent = {
+      id: record.id,
+      parentId: record.parentId,
+      depth: record.depth,
+      name: record.name,
+      task: record.task,
+      agent: record.agent ?? undefined,
+      surface: "",
+      startTime: record.lastLaunchedAt,
+      sessionFile: record.sessionFile,
+      activityFile: record.activityFile,
+      interactive: false,
+      statusState,
+      lineageFile: latestLineageFile ?? undefined,
+      lineageToken: record.token,
+    };
+    observeRunningSubagent(synthetic);
+    lineageStatusStates.set(record.id, synthetic.statusState);
+    return synthetic;
+  });
+  return agents.sort((a, b) => a.depth - b.depth || a.startTime - b.startTime || a.id.localeCompare(b.id));
+}
+
+function viewerSnapshotFile(id: string): string | null {
+  if (!latestLineageFile) return null;
+  return join(dirname(latestLineageFile), "subagent-viewers", `${id}.json`);
+}
+
+function observableEventsFor(agent: RunningSubagent, limit: number): SubagentMonitorEvent[] {
+  const direct = runningSubagents.get(agent.id);
+  if (direct && resolve(direct.sessionFile) === resolve(agent.sessionFile)) {
+    return readRecentSubagentEvents(direct.sessionFile, limit, direct.startTime);
+  }
+  const activity = agent.activity;
+  if (!activity) return [];
+  const label = activityLabel(activity);
+  return [{
+    kind: activity.toolName ? "tool" : "assistant",
+    text: sanitizeMonitorText(
+      [activity.latestEvent, activity.toolName, activity.toolSummary ?? label].filter(Boolean).join(" · "),
+      240,
+    ),
+  }];
+}
+
+function refreshViewerSnapshot(agent: RunningSubagent): string | null {
+  const file = viewerSnapshotFile(agent.id);
+  if (!file) return null;
+  const snapshot = classifyStatus(agent.statusState, Date.now());
+  writeViewerSnapshot(file, {
+    id: agent.id,
+    parentId: agent.parentId,
+    name: agent.name,
+    agent: agent.agent ?? null,
+    depth: agent.depth,
+    status: formatWidgetRightLabel(snapshot).trim(),
+    elapsed: formatElapsedMMSS(agent.startTime),
+    events: observableEventsFor(agent, 20),
+  });
+  return file;
+}
 
 // When this extension is loaded inside a subagent that itself spawns children
 // (e.g. a worker delegating to scout/researcher), `subagent-done.ts` runs in the
@@ -857,7 +1027,10 @@ function borderBottom(width: number): string {
 function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): string[] {
   const count = agents.length;
   const title = "Subagents";
-  const info = `${count} running`;
+  const launchInfo = latestLineageUsage
+    ? ` · ${latestLineageUsage.used}/${latestLineageUsage.limit} launches`
+    : "";
+  const info = `${count} active${launchInfo}`;
 
   const lines: string[] = [borderTop(title, info, width)];
 
@@ -866,7 +1039,8 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
     const agentTag = agent.agent ? ` (${agent.agent})` : "";
     const snapshot = classifyStatus(agent.statusState, Date.now());
     const icon = widgetIcon(snapshot.kind);
-    const left = ` ${icon} ${elapsed}  ${agent.name}${agentTag} `;
+    const treeIndent = "  ".repeat(Math.max(0, agent.depth - 1));
+    const left = ` ${icon} ${elapsed}  ${treeIndent}${agent.name}${agentTag} [${agent.id}] `;
     const right = statusConfig.enabled
       ? formatWidgetRightLabel(snapshot)
       : agent.cli === "claude"
@@ -884,6 +1058,7 @@ function syncSubagentStatusWidget(
   ui: SubagentWidgetUI,
   registration: SubagentWidgetRegistration,
   getAgents: () => RunningSubagent[],
+  onRowClick?: (agent: RunningSubagent) => void,
 ): void {
   if (getAgents().length === 0) {
     if (registration.installed) ui.setWidget("subagent-status", undefined);
@@ -901,10 +1076,21 @@ function syncSubagentStatusWidget(
     "subagent-status",
     (tui: { requestRender(): void }) => {
       registration.tui = tui;
+      let renderedIds: string[] = [];
       return {
         invalidate() {},
         render(width: number) {
-          return renderSubagentWidgetLines(getAgents(), width);
+          const agents = getAgents();
+          renderedIds = agents.map((agent) => agent.id);
+          return renderSubagentWidgetLines(agents, width);
+        },
+        handleMouse(event: TuiMouseEvent) {
+          if (event.type !== "click" || event.button !== "left") return undefined;
+          const id = renderedIds[event.y - 1];
+          const agent = id ? getAgents().find((candidate) => candidate.id === id) : undefined;
+          if (!agent) return undefined;
+          onRowClick?.(agent);
+          return { handled: true };
         },
       };
     },
@@ -915,14 +1101,36 @@ function syncSubagentStatusWidget(
 
 function updateWidget() {
   if (!latestCtx?.hasUI) return;
+  const now = Date.now();
+  if (latestLineageFile && now - latestLineageReconcileAt >= 5_000) {
+    latestLineageReconcileAt = now;
+    void reconcileLineageLedger(latestLineageFile, now).then((changed) => {
+      if (changed) subagentWidgetRegistration.tui?.requestRender();
+    }).catch(() => {});
+  }
+  const agents = activeLineageAgents();
+  for (const agent of agents) {
+    try { refreshViewerSnapshot(agent); } catch {}
+  }
 
   syncSubagentStatusWidget(
     latestCtx.ui,
     subagentWidgetRegistration,
-    () => Array.from(runningSubagents.values()),
+    () => flattenMonitorTree(activeLineageAgents()),
+    (agent) => {
+      const ctx = latestCtx;
+      if (!ctx) return;
+      const snapshotFile = refreshViewerSnapshot(agent);
+      if (runtimeConfig.herdrViewer.enabled && herdrViewer.available() && snapshotFile) {
+        void herdrViewer.openOrFocus({ id: agent.id, name: agent.name, snapshotFile })
+          .catch((error) => ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"));
+        return;
+      }
+      void showSubagentLog(ctx, `${agent.name} [${agent.id}]`, agent.sessionFile);
+    },
   );
 
-  if (runningSubagents.size === 0 && widgetInterval) {
+  if (agents.length === 0 && widgetInterval) {
     clearInterval(widgetInterval);
     widgetInterval = null;
     (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
@@ -961,15 +1169,66 @@ function monitorEventText(event: SubagentMonitorEvent, theme: Theme): string {
   return ` ${prefix} ${theme.fg(event.kind === "error" ? "error" : "text", event.text)}`;
 }
 
-function renderSubagentMonitorLines(
+function flattenMonitorTree(
   agents: RunningSubagent[],
+  expandedIds?: ReadonlySet<string>,
+): RunningSubagent[] {
+  const byParent = new Map<string | null, RunningSubagent[]>();
+  const ids = new Set(agents.map((agent) => agent.id));
+  for (const agent of agents) {
+    const parent = agent.parentId && ids.has(agent.parentId) ? agent.parentId : null;
+    const children = byParent.get(parent) ?? [];
+    children.push(agent);
+    byParent.set(parent, children);
+  }
+  for (const children of byParent.values()) children.sort((a, b) => a.startTime - b.startTime || a.id.localeCompare(b.id));
+  const output: RunningSubagent[] = [];
+  const visited = new Set<string>();
+  const hidden = new Set<string>();
+  const hideDescendants = (parentId: string) => {
+    const stack = [parentId];
+    while (stack.length > 0) {
+      const parent = stack.pop()!;
+      for (const child of byParent.get(parent) ?? []) {
+        if (hidden.has(child.id) || visited.has(child.id)) continue;
+        hidden.add(child.id);
+        stack.push(child.id);
+      }
+    }
+  };
+  const visit = (first: RunningSubagent) => {
+    const stack = [first];
+    while (stack.length > 0) {
+      const agent = stack.pop()!;
+      if (visited.has(agent.id) || hidden.has(agent.id)) continue;
+      visited.add(agent.id);
+      output.push(agent);
+      if (expandedIds && !expandedIds.has(agent.id)) {
+        hideDescendants(agent.id);
+        continue;
+      }
+      const children = byParent.get(agent.id) ?? [];
+      for (let index = children.length - 1; index >= 0; index--) stack.push(children[index]!);
+    }
+  };
+  for (const root of byParent.get(null) ?? []) visit(root);
+  // Structurally valid but cyclic records have no root. Keep them observable
+  // without re-inserting descendants hidden by a deliberately collapsed row.
+  for (const agent of agents) if (!visited.has(agent.id) && !hidden.has(agent.id)) visit(agent);
+  return output;
+}
+
+function renderSubagentMonitorLines(
+  allAgents: RunningSubagent[],
   selectedId: string | undefined,
   width: number,
   theme: Theme,
+  expandedIds?: ReadonlySet<string>,
 ): string[] {
+  const agents = flattenMonitorTree(allAgents, expandedIds);
   const lines = [monitorBorder("top", width, theme)];
   lines.push(monitorRow(
-    ` ${theme.fg("accent", theme.bold("Subagents"))} ${theme.fg("dim", `· ${agents.length} running`)}`,
+    ` ${theme.fg("accent", theme.bold("Subagents"))} ${theme.fg("dim", `· ${allAgents.length} active`)}`,
     width,
     theme,
   ));
@@ -990,10 +1249,13 @@ function renderSubagentMonitorLines(
     const selected = agent.id === agents[selectedIndex]?.id;
     const snapshot = classifyStatus(agent.statusState, Date.now());
     const status = formatWidgetRightLabel(snapshot).trim();
-    const marker = selected ? theme.fg("accent", "▶") : " ";
+    const selectedMarker = selected ? theme.fg("accent", "●") : " ";
+    const hasChildren = allAgents.some((candidate) => candidate.parentId === agent.id);
+    const treeMarker = hasChildren ? (expandedIds?.has(agent.id) === false ? "▶" : "▼") : "·";
+    const indent = "  ".repeat(Math.max(0, agent.depth - 1));
     const role = agent.agent ? theme.fg("dim", ` (${agent.agent})`) : "";
     lines.push(monitorRow(
-      ` ${marker} ${theme.fg(selected ? "accent" : "text", agent.name)}${role} ${theme.fg("dim", `· ${status}`)}`,
+      ` ${selectedMarker} ${indent}${treeMarker} ${theme.fg(selected ? "accent" : "text", agent.name)}${role} ${theme.fg("dim", `[${agent.id}] · ${status}`)}`,
       width,
       theme,
     ));
@@ -1010,10 +1272,10 @@ function renderSubagentMonitorLines(
   const task = sanitizeMonitorText(selected.task, 300) || "(no task)";
   const activeAction = selected.activity?.toolSummary;
   const activeTool = selected.activity?.toolName;
-  const recentEvents = readRecentSubagentEvents(selected.sessionFile, 6, selected.startTime);
+  const recentEvents = observableEventsFor(selected, 6);
 
   lines.push(monitorBorder("divider", width, theme));
-  lines.push(monitorRow(` ${theme.fg("accent", theme.bold(selected.name))} ${theme.fg("dim", `· ${formatElapsedMMSS(selected.startTime)}`)}`, width, theme));
+  lines.push(monitorRow(` ${theme.fg("accent", theme.bold(selected.name))} ${theme.fg("dim", `[${selected.id}] · depth ${selected.depth} · ${formatElapsedMMSS(selected.startTime)}`)}`, width, theme));
   lines.push(monitorRow(` ${theme.fg("muted", "Model:")} ${model}`, width, theme));
   lines.push(monitorRow(` ${theme.fg("muted", "Status:")} ${formatWidgetRightLabel(snapshot).trim()}`, width, theme));
   lines.push(monitorRow(` ${theme.fg("muted", "Task:")} ${task}`, width, theme));
@@ -1030,7 +1292,7 @@ function renderSubagentMonitorLines(
   } else {
     for (const event of recentEvents) lines.push(monitorRow(monitorEventText(event, theme), width, theme));
   }
-  lines.push(monitorRow(` ${theme.fg("dim", "↑↓ select · Esc close · updates every 500ms")}`, width, theme));
+  lines.push(monitorRow(` ${theme.fg("dim", "↑↓ select · ←→ collapse/expand · Esc close · updates every 500ms")}`, width, theme));
   lines.push(monitorBorder("bottom", width, theme));
   return lines;
 }
@@ -1040,37 +1302,42 @@ async function showSubagentMonitor(ctx: ExtensionContext): Promise<void> {
     ctx.ui.notify("The live subagent monitor is available in interactive TUI mode.", "warning");
     return;
   }
-  if (runningSubagents.size === 0) {
+  if (activeLineageAgents().length === 0) {
     ctx.ui.notify("No subagents are currently running.", "info");
     return;
   }
 
-  let selectedId = Array.from(runningSubagents.values())[0]?.id;
+  let selectedId = activeLineageAgents()[0]?.id;
+  const expandedIds = new Set(activeLineageAgents().map((agent) => agent.id));
   let refreshTimer: ReturnType<typeof setInterval> | undefined;
   try {
     await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
       refreshTimer = setInterval(() => {
         const now = Date.now();
-        for (const running of runningSubagents.values()) observeRunningSubagent(running, now);
+        for (const running of activeLineageAgents()) observeRunningSubagent(running, now);
         tui.requestRender();
       }, 500);
 
       return {
         render(width: number) {
-          const agents = Array.from(runningSubagents.values());
-          if (!agents.some((agent) => agent.id === selectedId)) selectedId = agents[0]?.id;
-          return renderSubagentMonitorLines(agents, selectedId, width, theme);
+          const agents = activeLineageAgents();
+          const visible = flattenMonitorTree(agents, expandedIds);
+          if (!visible.some((agent) => agent.id === selectedId)) selectedId = visible[0]?.id;
+          return renderSubagentMonitorLines(agents, selectedId, width, theme, expandedIds);
         },
         handleInput(data: string) {
           if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
             done();
             return;
           }
-          const agents = Array.from(runningSubagents.values());
+          const allAgents = activeLineageAgents();
+          const agents = flattenMonitorTree(allAgents, expandedIds);
           if (agents.length === 0) return;
           let index = Math.max(0, agents.findIndex((agent) => agent.id === selectedId));
           if (matchesKey(data, "up")) index = Math.max(0, index - 1);
           else if (matchesKey(data, "down")) index = Math.min(agents.length - 1, index + 1);
+          else if (matchesKey(data, "left")) expandedIds.delete(agents[index]!.id);
+          else if (matchesKey(data, "right")) expandedIds.add(agents[index]!.id);
           else return;
           selectedId = agents[index]?.id;
           tui.requestRender();
@@ -1601,6 +1868,7 @@ export const __test__ = {
   borderLine,
   renderSubagentWidgetLines,
   renderSubagentMonitorLines,
+  flattenMonitorTree,
   renderSubagentLogLines,
   syncSubagentStatusWidget,
   loadAgentDefaults,
@@ -1642,6 +1910,8 @@ export const __test__ = {
   capabilityDetails,
   createSubagentHandoff,
   parseStructuredHandoff,
+  activeLineageAgents,
+  refreshViewerSnapshot,
 };
 
 function canDeliverToSession(
@@ -1708,9 +1978,6 @@ async function launchSubagent(
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
-  // A surface is an isolated background process with RPC input and log output.
-  const surface = options?.surface ?? createSurface(params.name);
-
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
   if (launchBehavior.seededSessionMode) {
@@ -1722,8 +1989,30 @@ async function launchSubagent(
     });
   }
 
-  const activityFile = getSubagentActivityFile(artifactDir, id);
+  const lineageContext = await resolveLineageContext(ctx);
+  const activityFile = getSubagentActivityFile(dirname(lineageContext.file), id);
   mkdirSync(dirname(activityFile), { recursive: true });
+  const childDepth = lineageContext.currentDepth + 1;
+  const lineageLease = await reserveLineageLaunch(lineageContext.file, {
+    id,
+    parentId: lineageContext.parentId,
+    name: params.name,
+    agent: params.agent ?? null,
+    depth: childDepth,
+    sessionFile: subagentSessionFile,
+    activityFile,
+    ownerPid: process.pid,
+    task: params.task,
+    kind: "launch",
+  });
+  let surface: string;
+  try {
+    // A surface is an isolated background process with RPC input and log output.
+    surface = options?.surface ?? createSurface(params.name);
+  } catch (error) {
+    await releaseLineageLaunch(lineageContext.file, id, lineageLease.token, { refundLaunch: true });
+    throw error;
+  }
   const { inheritsConversationContext } = launchBehavior;
 
   // Build the task message
@@ -1751,6 +2040,8 @@ async function launchSubagent(
     const pluginDir = join(SUBAGENTS_DIR, "plugin");
 
     const cmdParts: string[] = [];
+    cmdParts.push(...lineageEnvironmentParts(lineageContext, childDepth));
+    cmdParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
     cmdParts.push(`PI_CLAUDE_SENTINEL=${shellEscape(sentinelFile)}`);
     cmdParts.push("claude");
     cmdParts.push("--dangerously-skip-permissions");
@@ -1783,17 +2074,26 @@ async function launchSubagent(
       .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
-    sendLongCommand(surface, command, {
-      scriptPath: launchScriptFile,
-      scriptPreamble: [
-        `# Claude Code subagent launch script for ${params.name}`,
-        `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
-      ].join("\n"),
-    });
+    try {
+      sendLongCommand(surface, command, {
+        scriptPath: launchScriptFile,
+        scriptPreamble: [
+          `# Claude Code subagent launch script for ${params.name}`,
+          `# Generated: ${new Date().toISOString()}`,
+          `# Surface: ${surface}`,
+        ].join("\n"),
+      });
+    } catch (error) {
+      try { closeSurface(surface); } catch {}
+      await releaseLineageLaunch(lineageContext.file, id, lineageLease.token, { refundLaunch: true });
+      throw error;
+    }
+    await bindLineageLaunchToSurface(lineageContext, id, lineageLease.token, surface);
 
     const running: RunningSubagent = {
       id,
+      parentId: lineageContext.parentId,
+      depth: childDepth,
       name: params.name,
       task: params.task,
       agent: params.agent,
@@ -1807,6 +2107,9 @@ async function launchSubagent(
       sentinelFile,
       capabilities,
       interactive: effectiveInteractive,
+      lineageFile: lineageContext.file,
+      lineageToken: lineageLease.token,
+      lineageHeartbeatAt: startTime,
       statusState: createStatusState({
         source: "claude",
         startTimeMs: startTime,
@@ -1855,14 +2158,20 @@ async function launchSubagent(
     cwd: effectiveCwd ?? null,
     agentDir: resolvedAgentDir,
   };
-  writeSubagentLoadout(subagentSessionFile, loadout);
 
   // Apply model, identity, and the default-deny tool/extension restriction via
   // the shared helper (same code path resume uses — they can't drift).
-  applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
+  try {
+    writeSubagentLoadout(subagentSessionFile, loadout);
+    applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
+  } catch (error) {
+    try { closeSurface(surface); } catch {}
+    await releaseLineageLaunch(lineageContext.file, id, lineageLease.token, { refundLaunch: true });
+    throw error;
+  }
 
   // Build env prefix: subagent identity + config dir propagation + spawn allowlist
-  const envParts: string[] = [];
+  const envParts: string[] = lineageEnvironmentParts(lineageContext, childDepth);
 
   if (resolvedAgentDir) {
     envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resolvedAgentDir)}`);
@@ -1887,17 +2196,23 @@ async function launchSubagent(
   // Persist blank-session context for diagnostics while sending the expanded
   // task over RPC as the initial user message.
   if (launchBehavior.taskDelivery !== "direct") {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const safeName = params.name
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "") // strip everything except alphanumeric, spaces, hyphens
-      .replace(/\s+/g, "-") // spaces to hyphens
-      .replace(/-+/g, "-") // collapse multiple hyphens
-      .replace(/^-|-$/g, ""); // trim leading/trailing hyphens
-    const artifactName = `context/${safeName || "subagent"}-${timestamp}.md`;
-    const artifactPath = join(artifactDir, artifactName);
-    mkdirSync(dirname(artifactPath), { recursive: true });
-    writeFileSync(artifactPath, fullTask, "utf8");
+    try {
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      const safeName = params.name
+        .toLowerCase()
+        .replace(/[^a-z0-9\s-]/g, "") // strip everything except alphanumeric, spaces, hyphens
+        .replace(/\s+/g, "-") // spaces to hyphens
+        .replace(/-+/g, "-") // collapse multiple hyphens
+        .replace(/^-|-$/g, ""); // trim leading/trailing hyphens
+      const artifactName = `context/${safeName || "subagent"}-${timestamp}.md`;
+      const artifactPath = join(artifactDir, artifactName);
+      mkdirSync(dirname(artifactPath), { recursive: true });
+      writeFileSync(artifactPath, fullTask, "utf8");
+    } catch (error) {
+      try { closeSurface(surface); } catch {}
+      await releaseLineageLaunch(lineageContext.file, id, lineageLease.token, { refundLaunch: true });
+      throw error;
+    }
   }
 
   const promptArgs = buildPiPromptArgs({
@@ -1920,19 +2235,28 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-  sendLongCommand(surface, command, {
-    scriptPath: launchScriptFile,
-    scriptPreamble: [
-      `# Subagent launch script for ${params.name}`,
-      `# Generated: ${new Date().toISOString()}`,
-      `# Session: ${subagentSessionFile}`,
-      `# Surface: ${surface}`,
-    ].join("\n"),
-    initialInput,
-  });
+  try {
+    sendLongCommand(surface, command, {
+      scriptPath: launchScriptFile,
+      scriptPreamble: [
+        `# Subagent launch script for ${params.name}`,
+        `# Generated: ${new Date().toISOString()}`,
+        `# Session: ${subagentSessionFile}`,
+        `# Surface: ${surface}`,
+      ].join("\n"),
+      initialInput,
+    });
+  } catch (error) {
+    try { closeSurface(surface); } catch {}
+    await releaseLineageLaunch(lineageContext.file, id, lineageLease.token, { refundLaunch: true });
+    throw error;
+  }
+  await bindLineageLaunchToSurface(lineageContext, id, lineageLease.token, surface);
 
   const running: RunningSubagent = {
     id,
+    parentId: lineageContext.parentId,
+    depth: childDepth,
     name: params.name,
     task: params.task,
     agent: params.agent,
@@ -1945,6 +2269,9 @@ async function launchSubagent(
     activityFile,
     capabilities,
     interactive: effectiveInteractive,
+    lineageFile: lineageContext.file,
+    lineageToken: lineageLease.token,
+    lineageHeartbeatAt: startTime,
     statusState: createStatusState({
       source: "pi",
       startTimeMs: startTime,
@@ -2052,6 +2379,15 @@ async function watchSubagent(
       onTick() {
         observeRunningSubagent(running);
         deliverPendingQuestion(running);
+        const now = Date.now();
+        if (
+          running.lineageFile &&
+          running.lineageToken &&
+          now - (running.lineageHeartbeatAt ?? 0) >= 5_000
+        ) {
+          running.lineageHeartbeatAt = now;
+          void touchLineageLaunch(running.lineageFile, running.id, running.lineageToken, now);
+        }
       },
     });
 
@@ -2174,6 +2510,10 @@ async function watchSubagent(
         errorMessage: err?.message ?? String(err),
       }),
     };
+  } finally {
+    if (running.lineageFile && running.lineageToken) {
+      await releaseLineageLaunch(running.lineageFile, running.id, running.lineageToken).catch(() => false);
+    }
   }
 }
 
@@ -2182,11 +2522,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   let sessionGeneration = 0;
   latestPi = pi;
   // Capture the UI context for widget updates
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
     sessionGeneration += 1;
     sessionActive = true;
     latestPi = pi;
     latestCtx = ctx;
+    await resolveLineageContext(ctx);
+    if (activeLineageAgents().length > 0) startWidgetRefresh();
     // pi runs multiple sessions in one process. A prior session's shutdown
     // aborts the shared module poll-abort controller; install a fresh one so
     // subagents spawned in this session aren't watched against a dead signal.
@@ -2201,7 +2543,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // retire this extension runtime: background surfaces are detached on POSIX,
   // and merely aborting their watchers can otherwise leave nested descendants
   // alive after /new, /resume, reload, or process shutdown.
-  pi.on("session_shutdown", (_event, _ctx) => {
+  pi.on("session_shutdown", async (_event, _ctx) => {
     sessionActive = false;
     sessionGeneration += 1;
     if (latestPi === pi) latestPi = null;
@@ -2222,6 +2564,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (moduleAbort) moduleAbort.abort();
 
     const closeErrors: Error[] = [];
+    const lineageReleases: Array<Promise<boolean>> = [];
     for (const [_id, agent] of runningSubagents) {
       try {
         closeSurface(agent.surface);
@@ -2229,9 +2572,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         closeErrors.push(error instanceof Error ? error : new Error(String(error)));
       } finally {
         agent.abortController?.abort();
+        if (agent.lineageFile && agent.lineageToken) {
+          lineageReleases.push(releaseLineageLaunch(agent.lineageFile, agent.id, agent.lineageToken));
+        }
       }
     }
+    await Promise.allSettled(lineageReleases);
     runningSubagents.clear();
+    lineageStatusStates.clear();
+    latestLineageFile = null;
+    latestLineageUsage = null;
+    latestLineageReconcileAt = 0;
     if (closeErrors.length > 0) {
       throw new AggregateError(closeErrors, "Failed to terminate running subagents during session shutdown");
     }
@@ -2460,10 +2811,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Persist name → session so subagent_message({ name }) can resume this
         // subagent after it finishes (and after a pi restart). Done at launch,
         // not completion, so the handle exists even if the parent dies mid-run.
-        registerName(parentArtifactDir, running.name, {
-          sessionFile: running.sessionFile,
-          sessionId: getSessionId(running.sessionFile),
-        });
+        try {
+          registerName(parentArtifactDir, running.name, {
+            sessionFile: running.sessionFile,
+            sessionId: getSessionId(running.sessionFile),
+            subagentId: running.id,
+            depth: running.depth,
+            parentId: running.parentId,
+          });
+        } catch (error) {
+          runningSubagents.delete(running.id);
+          try { closeSurface(running.surface); } catch {}
+          if (running.lineageFile && running.lineageToken) {
+            await releaseLineageLaunch(running.lineageFile, running.id, running.lineageToken).catch(() => false);
+          }
+          throw error;
+        }
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)
@@ -2762,7 +3125,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const name = requestedName; // identity preservation: the resumed run reclaims its name
         const { autoExit, interactive } = resolveResumeLaunchBehavior();
         const startTime = Date.now();
-        const id = Math.random().toString(16).slice(2, 10);
 
         // Resolve the name to its session file via this session's registry.
         const parentArtifactDir = getArtifactDir(
@@ -2826,8 +3188,33 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Count lines cheaply (no per-line JSON.parse) so resuming a large
         // transcript doesn't block the UI.
         const entryCountBefore = countSessionEntryLines(sessionPath);
-
-        const surface = createSurface(name);
+        const lineageContext = await resolveLineageContext(ctx);
+        const id = entry.subagentId ?? entry.sessionId ?? getSessionId(sessionPath) ?? Math.random().toString(16).slice(2, 10);
+        const childDepth = entry.depth ?? lineageContext.currentDepth + 1;
+        const parentId = entry.parentId ?? lineageContext.parentId;
+        const sessionId = ctx.sessionManager.getSessionId();
+        const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
+        const activityFile = getSubagentActivityFile(dirname(lineageContext.file), id);
+        mkdirSync(dirname(activityFile), { recursive: true });
+        const lineageLease = await reserveLineageLaunch(lineageContext.file, {
+          id,
+          parentId,
+          name,
+          agent: loadout.agent,
+          depth: childDepth,
+          sessionFile: sessionPath,
+          activityFile,
+          ownerPid: process.pid,
+          task: message,
+          kind: "resume",
+        });
+        let surface: string;
+        try {
+          surface = createSurface(name);
+        } catch (error) {
+          await releaseLineageLaunch(lineageContext.file, id, lineageLease.token, { refundLaunch: true });
+          throw error;
+        }
 
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(sessionPath), "--mode", "rpc"];
@@ -2836,13 +3223,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
         parts.push("-e", shellEscape(subagentDonePath));
 
-        const sessionId = ctx.sessionManager.getSessionId();
-        const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
-        const activityFile = getSubagentActivityFile(artifactDir, id);
-        mkdirSync(dirname(activityFile), { recursive: true });
-
         // Replay the model, identity, and default-deny tool/extension sandbox.
-        applySandboxToParts(parts, loadout, { artifactDir, name });
+        try {
+          applySandboxToParts(parts, loadout, { artifactDir, name });
+        } catch (error) {
+          try { closeSurface(surface); } catch {}
+          await releaseLineageLaunch(lineageContext.file, id, lineageLease.token, { refundLaunch: true });
+          throw error;
+        }
         const resumedCapabilities: AgentCapabilitySummary = {
           ...resolveToolCapabilities(loadout.toolAllowlist),
           runtime: "pi",
@@ -2852,25 +3240,31 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
-          const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-          resumeMsgFile = join(
-            artifactDir,
-            "subagent-resume",
-            `${name
-              .toLowerCase()
-              .replace(/[^a-z0-9\s-]/g, "")
-              .replace(/\s+/g, "-")
-              .replace(/-+/g, "-")
-              .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
-          );
-          mkdirSync(dirname(resumeMsgFile), { recursive: true });
-          writeFileSync(resumeMsgFile, message, "utf8");
+          try {
+            const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+            resumeMsgFile = join(
+              artifactDir,
+              "subagent-resume",
+              `${name
+                .toLowerCase()
+                .replace(/[^a-z0-9\s-]/g, "")
+                .replace(/\s+/g, "-")
+                .replace(/-+/g, "-")
+                .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
+            );
+            mkdirSync(dirname(resumeMsgFile), { recursive: true });
+            writeFileSync(resumeMsgFile, message, "utf8");
+          } catch (error) {
+            try { closeSurface(surface); } catch {}
+            await releaseLineageLaunch(lineageContext.file, id, lineageLease.token, { refundLaunch: true });
+            throw error;
+          }
         }
 
         // Build env prefix — replay the snapshot's config dir + spawn whitelist
         // so the resumed process resolves the same agents/extensions and keeps
         // the same nested-spawn restriction it originally ran with.
-        const resumeEnvParts: string[] = [];
+        const resumeEnvParts: string[] = lineageEnvironmentParts(lineageContext, childDepth);
         const resumeAgentDir = loadout.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? null;
         if (resumeAgentDir) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resumeAgentDir)}`);
@@ -2905,21 +3299,30 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
         );
-        sendLongCommand(surface, command, {
-          scriptPath: launchScriptFile,
-          scriptPreamble: [
-            `# Subagent resume script for ${name}`,
-            `# Generated: ${new Date().toISOString()}`,
-            `# Session: ${sessionPath}`,
-            `# Surface: ${surface}`,
-            ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
-          ].join("\n"),
-          initialInput: resumeMsgFile ? buildRpcInput([message]) : undefined,
-        });
+        try {
+          sendLongCommand(surface, command, {
+            scriptPath: launchScriptFile,
+            scriptPreamble: [
+              `# Subagent resume script for ${name}`,
+              `# Generated: ${new Date().toISOString()}`,
+              `# Session: ${sessionPath}`,
+              `# Surface: ${surface}`,
+              ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
+            ].join("\n"),
+            initialInput: resumeMsgFile ? buildRpcInput([message]) : undefined,
+          });
+        } catch (error) {
+          try { closeSurface(surface); } catch {}
+          await releaseLineageLaunch(lineageContext.file, id, lineageLease.token, { refundLaunch: true });
+          throw error;
+        }
+        await bindLineageLaunchToSurface(lineageContext, id, lineageLease.token, surface);
 
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
           id,
+          parentId,
+          depth: childDepth,
           name,
           task: message,
           agent: loadout.agent ?? undefined,
@@ -2932,6 +3335,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           activityFile,
           capabilities: resumedCapabilities,
           interactive,
+          lineageFile: lineageContext.file,
+          lineageToken: lineageLease.token,
+          lineageHeartbeatAt: startTime,
           statusState: createStatusState({
             source: "pi",
             startTimeMs: startTime,

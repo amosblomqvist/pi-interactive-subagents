@@ -15,7 +15,9 @@ Each sub-agent runs in an isolated background process controlled through Pi's RP
 ╰────────────────────────────────────────────────────╯
 ```
 
-Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
+Spawn several in parallel — they run concurrently and steer results back independently as each finishes. A root-session lineage shares one persistent technical launch ledger across every child and grandchild, including resumed runs. The defaults allow depth 2 (root is 0), four active descendant processes total, and twelve launches for the lineage.
+
+The launch budget counts **process launches, including resumes**, not tokens, dollars, or model cost. Pre-spawn failures are refunded; cancellation and processes that actually started consume a launch. The counter never resets silently: after exhaustion, start a new root session or explicitly change the root configuration. These launcher limits are operational safeguards, not a sandbox against code that bypasses the launcher.
 
 ## Tools
 
@@ -191,6 +193,8 @@ Access is **whitelist-only**. Every sub-agent process is launched with `--no-ext
 
 Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn the agents in its `subagent_agents` list (enforced via `PI_SUBAGENT_ALLOWED`). There is no agentless spawn route, so a child can never escalate to a full-toolset profile by omitting its agent.
 
+Every launch and finished-session resume also acquires a generation-tokened lease in the root lineage ledger. The depth, active-process count, and cumulative launch count are checked under one cross-process file lock, so grandchildren cannot reset the budget in their own process. Releases are token-checked to prevent stale completion/cancellation races from deleting a retry's lease; abandoned owners are reclaimed conservatively without refunding launches. Existing lineage files retain usage across Pi restarts and refuse corrupt accounting rather than resetting it.
+
 Extensions can register additional tools for sub-agents at runtime via `registerToolExtension(name, path)` on the `__pi_interactive_subagents` process global. Restricted launches fail clearly when a declared extension-backed tool is unavailable; install or register the extension before using that profile rather than bypassing the whitelist.
 
 ## Role folders
@@ -214,13 +218,21 @@ Set a per-agent default with `cwd:` in frontmatter.
 
 The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (open for input or another stage), `stalled` (no valid snapshot for too long), or `running` (fallback). Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
 
-Use `/subagents` or `Ctrl+Alt+S` to open a live monitor. It shows each running agent's task, model, current tool and sanitized action, plus recent observable tool and assistant events. Use `/subagent-log <name>` to inspect recent events for a running or completed named session. These views read local activity/session artifacts directly in the TUI; they do not add monitoring output to the parent model's context. Thinking blocks are deliberately excluded.
+Use `/subagents` or `Ctrl+Alt+S` to open a live monitor. It shows the active descendant tree across the whole root lineage, with stable IDs, nesting depth, task, model, current tool, sanitized action, and bounded observable events. Use arrow keys to select and collapse/expand branches. Counts remain visible whenever descendants are active, not only while an agent is waiting. Use `/subagent-log <name>` to inspect recent events for a directly owned running or completed named session. These views do not add monitoring output to the parent model's context. Thinking blocks are deliberately excluded.
+
+In Pi's fullscreen mode, clicking a descendant widget row opens or focuses one Herdr tab for that stable descendant ID when `HERDR_ENV=1` and the viewer is enabled. The tab runs only `viewer-runtime.mjs` against a bounded sanitized snapshot; it never starts or attaches a second Pi process, sends input, invokes a model, exposes hidden reasoning, or browses arbitrary sessions. Concurrent clicks are idempotent. If Herdr is absent or the viewer is disabled, the same click falls back to Pi's read-only log overlay; regular terminal mode keeps `/subagents` and `Ctrl+Alt+S` because Pi 0.85.1 routes widget mouse input only in fullscreen mode. Herdr failures are reported without affecting subagent execution.
 
 Status display is configured via `config.json` in the extension directory (copy `config.json.example`; it's gitignored):
 
 ```json
 {
-  "status": { "enabled": true }
+  "status": { "enabled": true },
+  "delegation": {
+    "maxDepth": 2,
+    "maxConcurrentDescendants": 4,
+    "maxLaunchesPerLineage": 12
+  },
+  "herdrViewer": { "enabled": true }
 }
 ```
 

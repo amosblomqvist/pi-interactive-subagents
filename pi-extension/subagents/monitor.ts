@@ -68,7 +68,10 @@ export function sanitizeMonitorText(value: unknown, maxLength = MAX_EVENT_TEXT_L
       /\b(api[-_]?key|access[-_]?token|auth[-_]?token|password|passwd|secret)(\s*[:=]\s*)([^\s,;&]+)/gi,
       "$1$2[redacted]",
     )
-    .replace(/(\s--?(?:api[-_]?key|token|password|passwd|secret)\s+)(\S+)/gi, "$1[redacted]");
+    .replace(/(\s--?(?:api[-_]?key|token|password|passwd|secret)\s+)(\S+)/gi, "$1[redacted]")
+    .replace(/-----BEGIN [^-]{0,40}PRIVATE KEY-----.*?(?:-----END [^-]{0,40}PRIVATE KEY-----|$)/gi, "[private key redacted]")
+    .replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "[token redacted]")
+    .replace(/\b(?:sk-(?:proj-)?|gh[pousr]_|github_pat_|xox[baprs]-|AKIA)[A-Za-z0-9_-]{8,}\b/g, "[credential redacted]");
 
   if (text.length <= maxLength) return text;
   return `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;

@@ -1,5 +1,13 @@
 {
   "status": {
     "enabled": true
+  },
+  "delegation": {
+    "maxDepth": 2,
+    "maxConcurrentDescendants": 4,
+    "maxLaunchesPerLineage": 12
+  },
+  "herdrViewer": {
+    "enabled": true
   }
 }

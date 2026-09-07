@@ -1,0 +1,240 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import {
+  DEFAULT_DELEGATION_LIMITS,
+  ensureLineageLedger,
+  readLineageLedger,
+  reconcileLineageLedger,
+  releaseLineageLaunch,
+  reserveLineageLaunch,
+  setLineageLaunchOwner,
+  touchLineageLaunch,
+} from "../pi-extension/subagents/lineage.ts";
+
+function fixture(t: test.TestContext) {
+  const dir = mkdtempSync(join(tmpdir(), "subagent-lineage-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  return join(dir, "lineage.json");
+}
+
+test("defaults are conservative technical limits, not monetary budget", () => {
+  assert.deepEqual(DEFAULT_DELEGATION_LIMITS, {
+    maxDepth: 2,
+    maxConcurrentDescendants: 4,
+    maxLaunchesPerLineage: 12,
+  });
+});
+
+test("one persistent root-lineage ledger enforces depth, concurrency, and total launches", async (t) => {
+  const file = fixture(t);
+  await ensureLineageLedger(file, "root-session", DEFAULT_DELEGATION_LIMITS, { allowLimitUpdate: true });
+
+  const leases = [];
+  for (let i = 0; i < 4; i++) {
+    leases.push(await reserveLineageLaunch(file, {
+      id: `child-${i}`,
+      parentId: null,
+      name: `worker-${i}`,
+      agent: "worker",
+      depth: 1,
+      sessionFile: `/sessions/${i}.jsonl`,
+      activityFile: `/activity/${i}.json`,
+      ownerPid: process.pid,
+      task: "bounded task",
+      kind: "launch",
+    }));
+  }
+  await assert.rejects(
+    reserveLineageLaunch(file, {
+      id: "child-4", parentId: null, name: "worker-4", agent: "worker", depth: 1,
+      sessionFile: "/sessions/4.jsonl", activityFile: "/activity/4.json", ownerPid: process.pid,
+      task: "blocked", kind: "launch",
+    }),
+    /concurrent descendant limit.*4/i,
+  );
+
+  await releaseLineageLaunch(file, leases[0]!.id, leases[0]!.token);
+  const replacement = await reserveLineageLaunch(file, {
+    id: "child-4", parentId: null, name: "worker-4", agent: "worker", depth: 1,
+    sessionFile: "/sessions/4.jsonl", activityFile: "/activity/4.json", ownerPid: process.pid,
+    task: "allowed after release", kind: "launch",
+  });
+  assert.ok(replacement.token);
+
+  await assert.rejects(
+    reserveLineageLaunch(file, {
+      id: "too-deep", parentId: "child-4", name: "grandchild", agent: "scout", depth: 3,
+      sessionFile: "/sessions/deep.jsonl", activityFile: "/activity/deep.json", ownerPid: process.pid,
+      task: "blocked", kind: "launch",
+    }),
+    /depth limit.*2/i,
+  );
+
+  const ledger = readLineageLedger(file)!;
+  assert.equal(ledger.launchesUsed, 5);
+  assert.equal(Object.keys(ledger.active).length, 4);
+  assert.equal(ledger.lineageId, "root-session");
+});
+
+test("depth is derived from stable parent identity and cannot be reset by a child", async (t) => {
+  const file = fixture(t);
+  await ensureLineageLedger(file, "root", DEFAULT_DELEGATION_LIMITS, { allowLimitUpdate: true });
+  const parent = await reserveLineageLaunch(file, {
+    id: "parent", parentId: null, name: "worker", agent: "worker", depth: 1,
+    sessionFile: "parent.jsonl", activityFile: "parent.activity.json", ownerPid: process.pid,
+    task: "parent", kind: "launch",
+  });
+  const child = await reserveLineageLaunch(file, {
+    id: "child", parentId: "parent", name: "scout", agent: "scout", depth: 2,
+    sessionFile: "child.jsonl", activityFile: "child.activity.json", ownerPid: process.pid,
+    task: "child", kind: "launch",
+  });
+  assert.equal(child.depth, 2);
+  await assert.rejects(
+    reserveLineageLaunch(file, {
+      id: "spoofed", parentId: "child", name: "scout", agent: "scout", depth: 1,
+      sessionFile: "spoofed.jsonl", activityFile: "spoofed.activity.json", ownerPid: process.pid,
+      task: "reset depth", kind: "launch",
+    }),
+    /depth limit.*3.*maximum 2/i,
+  );
+  await assert.rejects(
+    reserveLineageLaunch(file, {
+      id: "orphan", parentId: "not-owned", name: "scout", agent: "scout", depth: 2,
+      sessionFile: "orphan.jsonl", activityFile: "orphan.activity.json", ownerPid: process.pid,
+      task: "orphan", kind: "launch",
+    }),
+    /parent not-owned is not registered/i,
+  );
+  await releaseLineageLaunch(file, child.id, child.token);
+  await releaseLineageLaunch(file, parent.id, parent.token);
+});
+
+test("parallel reservations cannot oversubscribe the shared concurrency limit", async (t) => {
+  const file = fixture(t);
+  const limits = { ...DEFAULT_DELEGATION_LIMITS, maxConcurrentDescendants: 2 };
+  await ensureLineageLedger(file, "root", limits, { allowLimitUpdate: true });
+  const outcomes = await Promise.allSettled(Array.from({ length: 4 }, (_, index) =>
+    reserveLineageLaunch(file, {
+      id: `parallel-${index}`, parentId: null, name: `worker-${index}`, agent: "worker", depth: 1,
+      sessionFile: `${index}.jsonl`, activityFile: `${index}.activity.json`, ownerPid: process.pid,
+      task: "parallel", kind: "launch",
+    })
+  ));
+  assert.equal(outcomes.filter((outcome) => outcome.status === "fulfilled").length, 2);
+  assert.equal(outcomes.filter((outcome) => outcome.status === "rejected").length, 2);
+  assert.equal(Object.keys(readLineageLedger(file)!.active).length, 2);
+});
+
+test("resume consumes the shared launch count without changing stable descendant identity", async (t) => {
+  const file = fixture(t);
+  const limits = { ...DEFAULT_DELEGATION_LIMITS, maxConcurrentDescendants: 1, maxLaunchesPerLineage: 2 };
+  await ensureLineageLedger(file, "root", limits, { allowLimitUpdate: true });
+
+  const first = await reserveLineageLaunch(file, {
+    id: "stable-id", parentId: null, name: "worker", agent: "worker", depth: 1,
+    sessionFile: "worker.jsonl", activityFile: "worker.activity.json", ownerPid: process.pid,
+    task: "first", kind: "launch",
+  });
+  await releaseLineageLaunch(file, first.id, first.token);
+  const resumed = await reserveLineageLaunch(file, {
+    id: "stable-id", parentId: null, name: "worker", agent: "worker", depth: 1,
+    sessionFile: "worker.jsonl", activityFile: "worker.activity.json", ownerPid: process.pid,
+    task: "follow up", kind: "resume",
+  });
+  assert.equal(resumed.id, "stable-id");
+  await releaseLineageLaunch(file, resumed.id, resumed.token);
+
+  await assert.rejects(
+    reserveLineageLaunch(file, {
+      id: "another", parentId: null, name: "scout", agent: "scout", depth: 1,
+      sessionFile: "scout.jsonl", activityFile: "scout.activity.json", ownerPid: process.pid,
+      task: "third", kind: "launch",
+    }),
+    /launch limit.*2.*new root session or explicitly change/i,
+  );
+  assert.equal(readLineageLedger(file)!.launchesUsed, 2);
+});
+
+test("failed pre-spawn rollback refunds only its reservation and stale tokens cannot release a retry", async (t) => {
+  const file = fixture(t);
+  await ensureLineageLedger(file, "root", { ...DEFAULT_DELEGATION_LIMITS, maxConcurrentDescendants: 1 }, { allowLimitUpdate: true });
+  const failed = await reserveLineageLaunch(file, {
+    id: "same", parentId: null, name: "worker", agent: "worker", depth: 1,
+    sessionFile: "worker.jsonl", activityFile: "a.json", ownerPid: process.pid,
+    task: "attempt", kind: "launch",
+  });
+  await releaseLineageLaunch(file, failed.id, failed.token, { refundLaunch: true });
+  assert.equal(readLineageLedger(file)!.launchesUsed, 0);
+
+  const retry = await reserveLineageLaunch(file, {
+    id: "same", parentId: null, name: "worker", agent: "worker", depth: 1,
+    sessionFile: "worker.jsonl", activityFile: "b.json", ownerPid: process.pid,
+    task: "retry", kind: "launch",
+  });
+  await releaseLineageLaunch(file, retry.id, failed.token);
+  assert.equal(Object.keys(readLineageLedger(file)!.active).length, 1);
+  await touchLineageLaunch(file, retry.id, retry.token, 12345);
+  assert.equal(readLineageLedger(file)!.active.same!.heartbeatAt, 12345);
+  assert.equal(await setLineageLaunchOwner(file, retry.id, retry.token, 54321, 12346), true);
+  assert.equal(readLineageLedger(file)!.active.same!.ownerPid, 54321);
+  assert.equal(await setLineageLaunchOwner(file, retry.id, "stale-token", 99999), false);
+  assert.equal(readLineageLedger(file)!.active.same!.ownerPid, 54321);
+  await releaseLineageLaunch(file, retry.id, retry.token);
+  assert.equal(Object.keys(readLineageLedger(file)!.active).length, 0);
+});
+
+test("abandoned active records are reclaimed without resetting launch usage", async (t) => {
+  const file = fixture(t);
+  const limits = { ...DEFAULT_DELEGATION_LIMITS, maxConcurrentDescendants: 1 };
+  await ensureLineageLedger(file, "root", limits, { allowLimitUpdate: true });
+  await reserveLineageLaunch(file, {
+    id: "stale", parentId: null, name: "worker", agent: "worker", depth: 1,
+    sessionFile: "stale.jsonl", activityFile: "stale.activity.json", ownerPid: 2_000_000_000,
+    task: "stale task", kind: "launch",
+  });
+  const raw = JSON.parse(readFileSync(file, "utf8"));
+  raw.active.stale.heartbeatAt = 0;
+  writeFileSync(file, JSON.stringify(raw));
+
+  assert.equal(await reconcileLineageLedger(file), true);
+  assert.equal(Object.keys(readLineageLedger(file)!.active).length, 0);
+  assert.equal(readLineageLedger(file)!.launchesUsed, 1);
+
+  const replacement = await reserveLineageLaunch(file, {
+    id: "fresh", parentId: null, name: "scout", agent: "scout", depth: 1,
+    sessionFile: "fresh.jsonl", activityFile: "fresh.activity.json", ownerPid: process.pid,
+    task: "fresh task", kind: "launch",
+  });
+  assert.equal(readLineageLedger(file)!.launchesUsed, 2);
+  assert.deepEqual(Object.keys(readLineageLedger(file)!.active), ["fresh"]);
+  await releaseLineageLaunch(file, replacement.id, replacement.token);
+});
+
+test("corrupt persisted accounting fails closed instead of silently resetting", async (t) => {
+  const file = fixture(t);
+  writeFileSync(file, "{not-json");
+  await assert.rejects(
+    ensureLineageLedger(file, "root", DEFAULT_DELEGATION_LIMITS, { allowLimitUpdate: true }),
+    /invalid.*refusing to reset launch accounting/i,
+  );
+});
+
+test("existing lineage keeps launch usage when root explicitly changes limits", async (t) => {
+  const file = fixture(t);
+  await ensureLineageLedger(file, "root", DEFAULT_DELEGATION_LIMITS, { allowLimitUpdate: true });
+  const lease = await reserveLineageLaunch(file, {
+    id: "a", parentId: null, name: "worker", agent: "worker", depth: 1,
+    sessionFile: "a.jsonl", activityFile: "a.activity.json", ownerPid: process.pid,
+    task: "task", kind: "launch",
+  });
+  await releaseLineageLaunch(file, lease.id, lease.token);
+
+  await ensureLineageLedger(file, "root", { maxDepth: 3, maxConcurrentDescendants: 5, maxLaunchesPerLineage: 20 }, { allowLimitUpdate: true });
+  const ledger = readLineageLedger(file)!;
+  assert.equal(ledger.launchesUsed, 1);
+  assert.equal(ledger.limits.maxLaunchesPerLineage, 20);
+});
