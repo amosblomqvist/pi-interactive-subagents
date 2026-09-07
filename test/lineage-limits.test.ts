@@ -25,6 +25,33 @@ function activityFile(file: string, id: string): string {
   return join(dirname(file), "subagent-activity", `${id}.json`);
 }
 
+test("version-one active records migrate a missing owner instance without resetting accounting", async (t) => {
+  const file = fixture(t);
+  await ensureLineageLedger(file, "root", DEFAULT_DELEGATION_LIMITS, { allowLimitUpdate: true });
+  await reserveLineageLaunch(file, {
+    id: "child", parentId: null, name: "worker", agent: "worker", depth: 1,
+    sessionFile: "safe.jsonl", activityFile: activityFile(file, "child"), ownerPid: process.pid,
+    task: "legacy", kind: "launch",
+  });
+  const legacy = JSON.parse(readFileSync(file, "utf8"));
+  delete legacy.active.child.ownerInstance;
+  writeFileSync(file, JSON.stringify(legacy));
+  assert.equal(readLineageLedger(file)?.active.child.ownerInstance, null);
+  const migrated = await ensureLineageLedger(file, "root", DEFAULT_DELEGATION_LIMITS, { allowLimitUpdate: false });
+  assert.equal(migrated.launchesUsed, 1);
+  assert.equal(migrated.active.child.token, legacy.active.child.token);
+  assert.equal(JSON.parse(readFileSync(file, "utf8")).active.child.ownerInstance, null);
+  for (const malformed of [false, 42, [], {}]) {
+    legacy.active.child.ownerInstance = malformed;
+    writeFileSync(file, JSON.stringify(legacy));
+    assert.equal(readLineageLedger(file), null);
+    await assert.rejects(
+      ensureLineageLedger(file, "root", DEFAULT_DELEGATION_LIMITS, { allowLimitUpdate: false }),
+      /invalid|corrupt/i,
+    );
+  }
+});
+
 test("defaults are conservative technical limits, not monetary budget", () => {
   assert.deepEqual(DEFAULT_DELEGATION_LIMITS, {
     maxDepth: 2,

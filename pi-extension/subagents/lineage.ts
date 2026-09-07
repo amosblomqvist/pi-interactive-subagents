@@ -179,7 +179,13 @@ function normalizeLedger(value: unknown, ledgerFile: string): LineageLedger | nu
   if (!descendants || !active) return null;
   if (Object.keys(descendants).length > MAX_RECORDS || Object.keys(active).length > MAX_RECORDS) return null;
   for (const [id, record] of Object.entries(descendants)) if (!validDescendant(record, id, false, ledgerFile)) return null;
-  for (const [id, record] of Object.entries(active)) if (!validDescendant(record, id, true, ledgerFile)) return null;
+  for (const [id, value] of Object.entries(active)) {
+    const record = asObject(value);
+    // Early version-one ledgers had no process-instance field. Preserve their
+    // leases as unknown owners rather than resetting accounting on reload.
+    if (record && !Object.hasOwn(record, "ownerInstance")) record.ownerInstance = null;
+    if (!validDescendant(record, id, true, ledgerFile)) return null;
+  }
 
   const descendantRecords = descendants as unknown as Record<string, LineageDescendantRecord>;
   const activeRecords = active as unknown as Record<string, ActiveLineageRecord>;
