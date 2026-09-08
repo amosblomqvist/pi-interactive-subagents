@@ -16,7 +16,6 @@ import { sanitizeMonitorText } from "./monitor.ts";
 export interface DelegationLimits {
   maxDepth: number;
   maxConcurrentDescendants: number;
-  /** null means cumulative process launches are not capped. */
   maxLaunchesPerLineage: number | null;
 }
 
@@ -459,6 +458,12 @@ export async function reserveLineageLaunch(
       throw new Error(
         `Subagent launch limit reached (${launchLimit} launches for this root-session lineage). ` +
         "Launches, including resumes, are an operational count, not a dollar budget. Start a new root session or explicitly change the delegation configuration; the count is never reset automatically.",
+      );
+    }
+    if (!existingDescendant && Object.keys(ledger.descendants).length >= MAX_RECORDS) {
+      throw new Error(
+        `Subagent persistent descendant metadata limit reached (${MAX_RECORDS} identities). ` +
+        "Resume an existing descendant or start a new root session.",
       );
     }
 

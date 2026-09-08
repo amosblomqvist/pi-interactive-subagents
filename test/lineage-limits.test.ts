@@ -25,6 +25,37 @@ function activityFile(file: string, id: string): string {
   return join(dirname(file), "subagent-activity", `${id}.json`);
 }
 
+function seedLedgerAtRecordCapacity(file: string, firstDescendantLaunches = 1): void {
+  const descendants: Record<string, unknown> = {};
+  for (let index = 0; index < 10_000; index++) {
+    const id = `d${index}`;
+    const launches = index === 0 ? firstDescendantLaunches : 1;
+    descendants[id] = {
+      id,
+      parentId: null,
+      name: "worker",
+      agent: "worker",
+      depth: 1,
+      sessionFile: `${id}.jsonl`,
+      activityFile: activityFile(file, id),
+      task: "seeded",
+      firstLaunchedAt: 1,
+      lastLaunchedAt: 1,
+      launches,
+    };
+  }
+  writeFileSync(file, JSON.stringify({
+    version: 1,
+    lineageId: "root",
+    createdAt: 1,
+    updatedAt: 1,
+    limits: DEFAULT_DELEGATION_LIMITS,
+    launchesUsed: 9_999 + firstDescendantLaunches,
+    descendants,
+    active: {},
+  }));
+}
+
 test("version-one active records migrate a missing owner instance without resetting accounting", async (t) => {
   const file = fixture(t);
   await ensureLineageLedger(file, "root", DEFAULT_DELEGATION_LIMITS, { allowLimitUpdate: true });
@@ -85,6 +116,48 @@ test("default lineage permits more than twelve sequential launches and resumes",
   assert.equal(ledger.launchesUsed, 14);
   assert.equal(ledger.descendants["child-0"]!.launches, 2);
   assert.equal(ledger.limits.maxLaunchesPerLineage, null);
+});
+
+test("new descendant identity is rejected before a full metadata ledger is mutated", async (t) => {
+  const file = fixture(t);
+  seedLedgerAtRecordCapacity(file);
+  const before = readFileSync(file, "utf8");
+  assert.equal(readLineageLedger(file)!.launchesUsed, 10_000);
+
+  await assert.rejects(
+    reserveLineageLaunch(file, {
+      id: "overflow", parentId: null, name: "worker", agent: "worker", depth: 1,
+      sessionFile: "overflow.jsonl", activityFile: activityFile(file, "overflow"), ownerPid: process.pid,
+      task: "new identity", kind: "launch",
+    }),
+    /descendant metadata.*10,?000/i,
+  );
+
+  assert.equal(readFileSync(file, "utf8"), before);
+  const ledger = readLineageLedger(file)!;
+  assert.equal(ledger.launchesUsed, 10_000);
+  assert.equal(Object.keys(ledger.descendants).length, 10_000);
+  assert.equal(ledger.descendants.overflow, undefined);
+});
+
+test("existing descendant resumes at metadata capacity with cumulative and per-descendant counts above 10000", async (t) => {
+  const file = fixture(t);
+  seedLedgerAtRecordCapacity(file, 10_001);
+  const seeded = readLineageLedger(file)!;
+  assert.equal(seeded.launchesUsed, 20_000);
+  assert.equal(seeded.descendants.d0!.launches, 10_001);
+
+  const resumed = await reserveLineageLaunch(file, {
+    id: "d0", parentId: null, name: "worker", agent: "worker", depth: 1,
+    sessionFile: "d0.jsonl", activityFile: activityFile(file, "d0"), ownerPid: process.pid,
+    task: "resume at capacity", kind: "resume",
+  });
+  const ledger = readLineageLedger(file)!;
+  assert.equal(ledger.launchesUsed, 20_001);
+  assert.equal(ledger.descendants.d0!.launches, 10_002);
+  assert.equal(Object.keys(ledger.descendants).length, 10_000);
+  await releaseLineageLaunch(file, resumed.id, resumed.token);
+  assert.equal(readLineageLedger(file)!.launchesUsed, 20_001);
 });
 
 test("inherited sessions cannot recreate a missing ledger with zero usage", async (t) => {

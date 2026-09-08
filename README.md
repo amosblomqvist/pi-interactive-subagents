@@ -240,7 +240,7 @@ Configure status, delegation, and the viewer with an external JSON file and set 
 }
 ```
 
-`maxLaunchesPerLineage: null` explicitly means unlimited cumulative process launches. A non-negative integer retains the finite-cap behavior used by older version-one configs and ledgers. Depth and active-descendant limits remain finite.
+`maxLaunchesPerLineage: null` explicitly means there is no cumulative process-launch policy cap. A non-negative integer retains the finite-cap behavior used by older version-one configs and ledgers. Depth and active-descendant limits remain finite. The existing 10,000-record bound on distinct persisted descendant identities remains a metadata resource guard: at capacity a new identity is rejected before mutation, while an existing identity can still resume and increment its accounting.
 
 ## Compatibility and verification
 
