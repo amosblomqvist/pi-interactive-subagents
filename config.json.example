@@ -5,7 +5,7 @@
   "delegation": {
     "maxDepth": 2,
     "maxConcurrentDescendants": 4,
-    "maxLaunchesPerLineage": 12
+    "maxLaunchesPerLineage": null
   },
   "herdrViewer": {
     "enabled": true

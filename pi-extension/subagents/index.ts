@@ -863,7 +863,14 @@ interface RunningSubagent {
 /** Directly owned running subagents, keyed by stable descendant id. */
 const runningSubagents = new Map<string, RunningSubagent>();
 const lineageStatusStates = new Map<string, SubagentStatusState>();
-let latestLineageUsage: { used: number; limit: number } | null = null;
+type LineageLaunchUsage = { used: number; limit: number | null };
+let latestLineageUsage: LineageLaunchUsage | null = null;
+
+function formatLineageLaunchUsage(usage: LineageLaunchUsage): string {
+  return usage.limit === null
+    ? `${usage.used} launches · unlimited`
+    : `${usage.used}/${usage.limit} launches`;
+}
 
 function activeLineageAgents(): RunningSubagent[] {
   const ledger = latestLineageFile ? readLineageLedger(latestLineageFile) : null;
@@ -1072,7 +1079,7 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
   const childCounts = activeChildCounts(agents);
   const title = "Subagents";
   const launchInfo = latestLineageUsage
-    ? ` · ${latestLineageUsage.used}/${latestLineageUsage.limit} launches`
+    ? ` · ${formatLineageLaunchUsage(latestLineageUsage)}`
     : "";
   const info = `${count} active${launchInfo}`;
 
@@ -1984,6 +1991,7 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
 export const __test__ = {
   borderLine,
   renderSubagentWidgetLines,
+  formatLineageLaunchUsage,
   renderSubagentMonitorLines,
   flattenMonitorTree,
   renderSubagentLogLines,

@@ -190,19 +190,38 @@ test("failed surface termination retains lineage capacity", () => {
   );
 });
 
-test("runtime config defaults and validates shared lineage limits", () => {
+test("runtime config defaults cumulative launches to unlimited and accepts legacy finite caps", () => {
   assert.deepEqual(parseRuntimeConfig({ status: { enabled: true } }), {
-    delegation: { maxDepth: 2, maxConcurrentDescendants: 4, maxLaunchesPerLineage: 12 },
+    delegation: { maxDepth: 2, maxConcurrentDescendants: 4, maxLaunchesPerLineage: null },
     herdrViewer: { enabled: true },
   });
+  assert.deepEqual(
+    parseRuntimeConfig({ delegation: { maxDepth: 2, maxConcurrentDescendants: 4, maxLaunchesPerLineage: null } }).delegation,
+    { maxDepth: 2, maxConcurrentDescendants: 4, maxLaunchesPerLineage: null },
+  );
+  assert.deepEqual(
+    parseRuntimeConfig({ delegation: { maxDepth: 2, maxConcurrentDescendants: 4, maxLaunchesPerLineage: 12 } }).delegation,
+    { maxDepth: 2, maxConcurrentDescendants: 4, maxLaunchesPerLineage: 12 },
+  );
   assert.throws(
     () => parseRuntimeConfig({ delegation: { maxDepth: 2, maxConcurrentDescendants: 4, maxLaunchesPerLineage: -1 } }),
     /maxLaunchesPerLineage/,
   );
   assert.throws(
-    () => parseRuntimeConfig({ delegation: { maxDepth: 2, maxConcurrentDescendants: 4, maxLaunchesPerLineage: 12, dollars: 1 } }),
+    () => parseRuntimeConfig({ delegation: { maxDepth: null, maxConcurrentDescendants: 4, maxLaunchesPerLineage: null } }),
+    /maxDepth/,
+  );
+  assert.throws(
+    () => parseRuntimeConfig({ delegation: { maxDepth: 2, maxConcurrentDescendants: 4, maxLaunchesPerLineage: null, dollars: 1 } }),
     /unsupported key.*dollars/,
   );
+});
+
+test("unlimited launch usage display is explicit without a numeric denominator", () => {
+  const rendered = __test__.formatLineageLaunchUsage({ used: 14, limit: null });
+  assert.equal(rendered, "14 launches · unlimited");
+  assert.doesNotMatch(rendered, /\/null|\/12/);
+  assert.equal(__test__.formatLineageLaunchUsage({ used: 3, limit: 12 }), "3/12 launches");
 });
 
 test("absolute external config is shared by runtime and status without package mutation", (t) => {

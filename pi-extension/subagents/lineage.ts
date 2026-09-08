@@ -16,13 +16,14 @@ import { sanitizeMonitorText } from "./monitor.ts";
 export interface DelegationLimits {
   maxDepth: number;
   maxConcurrentDescendants: number;
-  maxLaunchesPerLineage: number;
+  /** null means cumulative process launches are not capped. */
+  maxLaunchesPerLineage: number | null;
 }
 
 export const DEFAULT_DELEGATION_LIMITS: DelegationLimits = {
   maxDepth: 2,
   maxConcurrentDescendants: 4,
-  maxLaunchesPerLineage: 12,
+  maxLaunchesPerLineage: null,
 };
 
 export type LineageLaunchKind = "launch" | "resume";
@@ -118,6 +119,10 @@ function validLimit(value: unknown): value is number {
   return Number.isInteger(value) && (value as number) >= 0 && (value as number) <= MAX_RECORDS;
 }
 
+function validLaunchCount(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
 export function validateDelegationLimits(value: unknown): DelegationLimits {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("delegation limits must be an object");
@@ -126,13 +131,16 @@ export function validateDelegationLimits(value: unknown): DelegationLimits {
   const keys = ["maxDepth", "maxConcurrentDescendants", "maxLaunchesPerLineage"];
   const extra = Object.keys(input).filter((key) => !keys.includes(key));
   if (extra.length) throw new Error(`delegation limits have unsupported key(s): ${extra.join(", ")}`);
-  for (const key of keys) {
+  for (const key of ["maxDepth", "maxConcurrentDescendants"] as const) {
     if (!validLimit(input[key])) throw new Error(`delegation.${key} must be an integer from 0 to ${MAX_RECORDS}`);
+  }
+  if (input.maxLaunchesPerLineage !== null && !validLimit(input.maxLaunchesPerLineage)) {
+    throw new Error(`delegation.maxLaunchesPerLineage must be null or an integer from 0 to ${MAX_RECORDS}`);
   }
   return {
     maxDepth: input.maxDepth as number,
     maxConcurrentDescendants: input.maxConcurrentDescendants as number,
-    maxLaunchesPerLineage: input.maxLaunchesPerLineage as number,
+    maxLaunchesPerLineage: input.maxLaunchesPerLineage as number | null,
   };
 }
 
@@ -154,7 +162,7 @@ function validDescendant(value: unknown, id: string, active: boolean, ledgerFile
   if (!boundedString(record.sessionFile, MAX_PATH_LENGTH) || !boundedString(record.activityFile, MAX_PATH_LENGTH)) return false;
   if (resolve(record.activityFile) !== expectedActivityFile(ledgerFile, id)) return false;
   if (record.agent !== null && !boundedString(record.agent, 100)) return false;
-  if (!validLimit(record.depth) || !validLimit(record.launches) || (record.launches as number) < 1) return false;
+  if (!validLimit(record.depth) || !validLaunchCount(record.launches) || (record.launches as number) < 1) return false;
   if (!Number.isFinite(record.firstLaunchedAt) || !Number.isFinite(record.lastLaunchedAt)) return false;
   if (!active) return true;
   return boundedString(record.token, 128) && record.token.length > 0 &&
@@ -173,7 +181,7 @@ function normalizeLedger(value: unknown, ledgerFile: string): LineageLedger | nu
   } catch {
     return null;
   }
-  if (!validLimit(input.launchesUsed) || !Number.isFinite(input.createdAt) || !Number.isFinite(input.updatedAt)) return null;
+  if (!validLaunchCount(input.launchesUsed) || !Number.isFinite(input.createdAt) || !Number.isFinite(input.updatedAt)) return null;
   const descendants = asObject(input.descendants);
   const active = asObject(input.active);
   if (!descendants || !active) return null;
@@ -192,6 +200,7 @@ function normalizeLedger(value: unknown, ledgerFile: string): LineageLedger | nu
   let launchTotal = 0;
   for (const record of Object.values(descendantRecords)) {
     launchTotal += record.launches;
+    if (!Number.isSafeInteger(launchTotal)) return null;
     const parent = record.parentId ? descendantRecords[record.parentId] : null;
     if (record.parentId && !parent) return null;
     if (record.depth !== (parent ? parent.depth + 1 : 1)) return null;
@@ -445,15 +454,19 @@ export async function reserveLineageLaunch(
         "platforms without process-start identity conservatively retain an apparently live PID to avoid a PID-reuse race.",
       );
     }
-    if (ledger.launchesUsed >= ledger.limits.maxLaunchesPerLineage) {
+    const launchLimit = ledger.limits.maxLaunchesPerLineage;
+    if (launchLimit !== null && ledger.launchesUsed >= launchLimit) {
       throw new Error(
-        `Subagent launch limit reached (${ledger.limits.maxLaunchesPerLineage} launches for this root-session lineage). ` +
+        `Subagent launch limit reached (${launchLimit} launches for this root-session lineage). ` +
         "Launches, including resumes, are an operational count, not a dollar budget. Start a new root session or explicitly change the delegation configuration; the count is never reset automatically.",
       );
     }
 
     const token = randomBytes(16).toString("hex");
     const previousLaunches = existingDescendant?.launches ?? 0;
+    if (ledger.launchesUsed >= Number.MAX_SAFE_INTEGER || previousLaunches >= Number.MAX_SAFE_INTEGER) {
+      throw new Error("Subagent lineage launch accounting exceeds the safe integer range");
+    }
     const descendant: LineageDescendantRecord = {
       id: request.id,
       parentId,

@@ -15,9 +15,9 @@ Each sub-agent runs in an isolated background process controlled through Pi's RP
 ╰────────────────────────────────────────────────────╯
 ```
 
-Spawn several in parallel — they run concurrently and steer results back independently as each finishes. A root-session lineage shares one persistent technical launch ledger across every child and grandchild, including resumed runs. The defaults allow depth 2 (root is 0), four active descendant processes total, and twelve launches for the lineage.
+Spawn several in parallel — they run concurrently and steer results back independently as each finishes. A root-session lineage shares one persistent technical launch ledger across every child and grandchild, including resumed runs. The defaults allow depth 2 (root is 0), four active descendant processes total, and unlimited cumulative launches for the lineage.
 
-The launch budget counts **process launches, including resumes**, not tokens, dollars, or model cost. Pre-spawn failures are refunded; cancellation and processes that actually started consume a launch. The counter never resets silently: after exhaustion, start a new root session or explicitly change the root configuration. These launcher limits are operational safeguards, not a sandbox against code that bypasses the launcher.
+The launch counter tracks **process launches, including resumes**, not tokens, dollars, or model cost. Pre-spawn failures are refunded; cancellation and processes that actually started consume a launch. The count remains persisted even when cumulative launches are unlimited. Set `maxLaunchesPerLineage` to a non-negative integer for an explicit finite cap; after that cap is exhausted, start a new root session or explicitly change the root configuration. These launcher limits are operational safeguards, not a sandbox against code that bypasses the launcher.
 
 ## Tools
 
@@ -193,7 +193,7 @@ Access is **whitelist-only**. Every sub-agent process is launched with `--no-ext
 
 Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn the agents in its `subagent_agents` list (enforced via `PI_SUBAGENT_ALLOWED`). There is no agentless spawn route, so a child can never escalate to a full-toolset profile by omitting its agent.
 
-Every launch and finished-session resume also acquires a generation-tokened lease in the root lineage ledger. The depth, active-process count, and cumulative launch count are checked under one cross-process file lock, so grandchildren cannot reset the budget in their own process. Releases are token-checked to prevent stale completion/cancellation races from deleting a retry's lease; failed process termination retains capacity, and abandoned owners are reclaimed conservatively without refunding launches. Linux process-start ticks disambiguate PID reuse; platforms without a comparable identity retain ambiguous live-PID capacity rather than claiming the PID is the original process. Existing lineage files retain usage across Pi restarts, inherited children cannot recreate a missing ledger, and corrupt accounting is refused rather than reset.
+Every launch and finished-session resume also acquires a generation-tokened lease in the root lineage ledger. The depth, active-process count, and cumulative launch count are checked under one cross-process file lock, so grandchildren cannot reset the accounting in their own process. Releases are token-checked to prevent stale completion/cancellation races from deleting a retry's lease; failed process termination retains capacity, and abandoned owners are reclaimed conservatively without refunding launches. Linux process-start ticks disambiguate PID reuse; platforms without a comparable identity retain ambiguous live-PID capacity rather than claiming the PID is the original process. Existing lineage files retain usage across Pi restarts, inherited children cannot recreate a missing ledger or loosen its root policy, and corrupt accounting is refused rather than reset. On normal root initialization, the current root configuration is applied without clearing usage, descendants, or active leases; this migrates an old default finite ledger to the current unlimited default.
 
 Lineage locks are never deleted automatically based on age because doing so can remove a replacement owner's lock. A lock timeout reports its bounded owner record and the exact `.lock` directory. Only remove that directory manually after confirming every owning Pi process has stopped.
 
@@ -234,11 +234,13 @@ Configure status, delegation, and the viewer with an external JSON file and set 
   "delegation": {
     "maxDepth": 2,
     "maxConcurrentDescendants": 4,
-    "maxLaunchesPerLineage": 12
+    "maxLaunchesPerLineage": null
   },
   "herdrViewer": { "enabled": true }
 }
 ```
+
+`maxLaunchesPerLineage: null` explicitly means unlimited cumulative process launches. A non-negative integer retains the finite-cap behavior used by older version-one configs and ledgers. Depth and active-descendant limits remain finite.
 
 ## Compatibility and verification
 
