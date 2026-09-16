@@ -1,7 +1,7 @@
 ---
 name: test-echo
 description: Integration test agent — completes simple file-writing tasks
-model: anthropic/claude-haiku-4-5
+model: deepseek/deepseek-flash
 tools: read, bash, write, edit
 spawning: false
 auto-exit: true

@@ -11,10 +11,20 @@ const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_STATUS_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
 const STATUS_CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
 
-export type SubagentStatusKind = "starting" | "active" | "waiting" | "stalled" | "running";
-export type SubagentStatusSource = "pi" | "claude";
+export type SubagentStatusKind =
+  | "starting"
+  | "active"
+  | "waiting"
+  | "stalled"
+  | "running";
+export type SubagentStatusSource = "pi";
 export type SubagentStatusTransition = "stalled" | "recovered" | null;
-export type StatusSnapshotState = "unseen" | "present" | "missing" | "invalid" | "wrong-id";
+export type StatusSnapshotState =
+  | "unseen"
+  | "present"
+  | "missing"
+  | "invalid"
+  | "wrong-id";
 export type StatusActivityPhase = "starting" | "active" | "waiting" | "done";
 
 export interface StatusConfig {
@@ -87,14 +97,22 @@ function invalidStatusConfig(source: string, message: string): never {
   throw new Error(`Invalid subagent status config in ${source}: ${message}`);
 }
 
-function requireObject(value: unknown, source: string, fieldName: string): Record<string, unknown> {
+function requireObject(
+  value: unknown,
+  source: string,
+  fieldName: string,
+): Record<string, unknown> {
   if (value == null || typeof value !== "object" || Array.isArray(value)) {
     invalidStatusConfig(source, `${fieldName} must be an object`);
   }
   return value as Record<string, unknown>;
 }
 
-function requireBoolean(value: unknown, source: string, fieldName: string): boolean {
+function requireBoolean(
+  value: unknown,
+  source: string,
+  fieldName: string,
+): boolean {
   if (typeof value !== "boolean") {
     invalidStatusConfig(source, `${fieldName} must be a boolean`);
   }
@@ -107,9 +125,14 @@ function rejectUnsupportedKeys(
   source: string,
   fieldName: string,
 ): void {
-  const unsupportedKeys = Object.keys(value).filter((key) => !allowedKeys.includes(key));
+  const unsupportedKeys = Object.keys(value).filter(
+    (key) => !allowedKeys.includes(key),
+  );
   if (unsupportedKeys.length > 0) {
-    invalidStatusConfig(source, `${fieldName} has unsupported key(s): ${unsupportedKeys.join(", ")}`);
+    invalidStatusConfig(
+      source,
+      `${fieldName} has unsupported key(s): ${unsupportedKeys.join(", ")}`,
+    );
   }
 }
 
@@ -128,16 +151,23 @@ function boundStatusLine(line: string): string {
   return truncateText(line.replace(/\s+/g, " ").trim(), MAX_STATUS_LINE_LENGTH);
 }
 
-function snapshotProblemLabel(snapshotState: StatusSnapshotState): string | null {
+function snapshotProblemLabel(
+  snapshotState: StatusSnapshotState,
+): string | null {
   if (snapshotState === "wrong-id") return "wrong activity id";
   return null;
 }
 
-function activityLabel(snapshot: Pick<StatusSnapshot, "activityLabel" | "activeScope">): string | null {
+function activityLabel(
+  snapshot: Pick<StatusSnapshot, "activityLabel" | "activeScope">,
+): string | null {
   return snapshot.activityLabel ?? snapshot.activeScope;
 }
 
-export function parseStatusConfig(rawConfig: unknown, source = "config.json"): StatusConfig {
+export function parseStatusConfig(
+  rawConfig: unknown,
+  source = "config.json",
+): StatusConfig {
   const config = requireObject(rawConfig, source, "root");
   const status = requireObject(config.status, source, "status");
   rejectUnsupportedKeys(status, ["enabled"], source, "status");
@@ -149,16 +179,25 @@ export function parseStatusConfig(rawConfig: unknown, source = "config.json"): S
   };
 }
 
-function readStatusConfigFile(configPath: string, examplePath: string): { sourcePath: string; rawConfig: string } {
+function readStatusConfigFile(
+  configPath: string,
+  examplePath: string,
+): { sourcePath: string; rawConfig: string } {
   try {
-    return { sourcePath: configPath, rawConfig: readFileSync(configPath, "utf8") };
+    return {
+      sourcePath: configPath,
+      rawConfig: readFileSync(configPath, "utf8"),
+    };
   } catch (error) {
     const errno = error as NodeJS.ErrnoException;
     if (errno.code !== "ENOENT") throw error;
   }
 
   try {
-    return { sourcePath: examplePath, rawConfig: readFileSync(examplePath, "utf8") };
+    return {
+      sourcePath: examplePath,
+      rawConfig: readFileSync(examplePath, "utf8"),
+    };
   } catch (error) {
     const errno = error as NodeJS.ErrnoException;
     if (errno.code === "ENOENT") {
@@ -174,7 +213,10 @@ export function loadStatusConfig(
   configPath = DEFAULT_STATUS_CONFIG_PATH,
   examplePath = STATUS_CONFIG_EXAMPLE_PATH,
 ): StatusConfig {
-  const { sourcePath, rawConfig } = readStatusConfigFile(configPath, examplePath);
+  const { sourcePath, rawConfig } = readStatusConfigFile(
+    configPath,
+    examplePath,
+  );
 
   let parsed: unknown;
   try {
@@ -202,7 +244,7 @@ export function createStatusState(params: {
   source: SubagentStatusSource;
   startTimeMs: number;
 }): SubagentStatusState {
-  const initialKind = params.source === "claude" ? "running" : "starting";
+  const initialKind: SubagentStatusKind = "starting";
   return {
     source: params.source,
     startTimeMs: params.startTimeMs,
@@ -218,7 +260,7 @@ export function createStatusState(params: {
     phase: null,
     latestEvent: null,
     activityLabel: null,
-    snapshotState: params.source === "claude" ? "unseen" : "unseen",
+    snapshotState: "unseen",
     snapshotProblemSinceMs: null,
     snapshotError: null,
     currentKind: initialKind,
@@ -230,8 +272,6 @@ export function observeStatus(
   observation: StatusObservation,
   now: number,
 ): SubagentStatusState {
-  if (state.source === "claude") return state;
-
   if (observation.snapshot !== "present") {
     return {
       ...state,
@@ -246,26 +286,31 @@ export function observeStatus(
   const sequence = observation.sequence;
   const lastActivityAtMs = state.lastActivityAtMs;
   const lastActivitySequence = state.lastActivitySequence;
-  const olderThanLastActivity = lastActivityAtMs != null && (
-    updatedAt < lastActivityAtMs ||
-    (updatedAt === lastActivityAtMs && lastActivitySequence != null && sequence < lastActivitySequence)
-  );
+  const olderThanLastActivity =
+    lastActivityAtMs != null &&
+    (updatedAt < lastActivityAtMs ||
+      (updatedAt === lastActivityAtMs &&
+        lastActivitySequence != null &&
+        sequence < lastActivitySequence));
   if (olderThanLastActivity) return state;
 
-  const blockedByLocalOverride = state.localOverrideAtMs != null && (
-    updatedAt < state.localOverrideAtMs ||
-    (updatedAt === state.localOverrideAtMs && state.localOverrideSequence != null && sequence <= state.localOverrideSequence)
-  );
+  const blockedByLocalOverride =
+    state.localOverrideAtMs != null &&
+    (updatedAt < state.localOverrideAtMs ||
+      (updatedAt === state.localOverrideAtMs &&
+        state.localOverrideSequence != null &&
+        sequence <= state.localOverrideSequence));
   if (blockedByLocalOverride) return state;
 
   const phase = observation.phase;
   const activeNow = phase === "active" || observation.active === true;
   const activeSinceMs = activeNow
-    ? observation.activeSince ?? state.activeSinceMs ?? updatedAt
+    ? (observation.activeSince ?? state.activeSinceMs ?? updatedAt)
     : null;
-  const waitingSinceMs = phase === "waiting"
-    ? observation.waitingSince ?? state.waitingSinceMs ?? updatedAt
-    : null;
+  const waitingSinceMs =
+    phase === "waiting"
+      ? (observation.waitingSince ?? state.waitingSinceMs ?? updatedAt)
+      : null;
 
   return {
     ...state,
@@ -274,7 +319,7 @@ export function observeStatus(
     lastActivitySequence: sequence,
     activeNow,
     activeSinceMs,
-    activeScope: activeNow ? observation.activeScope ?? null : null,
+    activeScope: activeNow ? (observation.activeScope ?? null) : null,
     waitingSinceMs,
     phase,
     latestEvent: observation.latestEvent ?? null,
@@ -287,9 +332,10 @@ export function observeStatus(
   };
 }
 
-export function forceStatusAfterInterrupt(state: SubagentStatusState, now: number): SubagentStatusState {
-  if (state.source === "claude") return state;
-
+export function forceStatusAfterInterrupt(
+  state: SubagentStatusState,
+  now: number,
+): SubagentStatusState {
   return {
     ...state,
     firstObservationAtMs: state.firstObservationAtMs ?? now,
@@ -310,7 +356,10 @@ export function forceStatusAfterInterrupt(state: SubagentStatusState, now: numbe
   };
 }
 
-function classifyProblemState(state: SubagentStatusState, now: number): Pick<StatusSnapshot, "kind" | "statusLabel"> {
+function classifyProblemState(
+  state: SubagentStatusState,
+  now: number,
+): Pick<StatusSnapshot, "kind" | "statusLabel"> {
   const problemLabel = snapshotProblemLabel(state.snapshotState);
   const hasValidSnapshot = state.lastActivityAtMs != null;
 
@@ -324,7 +373,8 @@ function classifyProblemState(state: SubagentStatusState, now: number): Pick<Sta
 
   const problemSinceMs = state.snapshotProblemSinceMs ?? now;
   const problemMs = Math.max(0, now - problemSinceMs);
-  if (problemMs >= SNAPSHOT_STALLED_AFTER_MS) return { kind: "stalled", statusLabel: problemLabel };
+  if (problemMs >= SNAPSHOT_STALLED_AFTER_MS)
+    return { kind: "stalled", statusLabel: problemLabel };
 
   const lastHealthyKind = state.activeNow
     ? "active"
@@ -336,28 +386,12 @@ function classifyProblemState(state: SubagentStatusState, now: number): Pick<Sta
   return { kind: lastHealthyKind, statusLabel: problemLabel };
 }
 
-export function classifyStatus(state: SubagentStatusState, now: number): StatusSnapshot {
+export function classifyStatus(
+  state: SubagentStatusState,
+  now: number,
+): StatusSnapshot {
   const elapsedMs = Math.max(0, now - state.startTimeMs);
   const elapsedText = formatElapsedDuration(elapsedMs);
-
-  if (state.source === "claude") {
-    return {
-      kind: "running",
-      elapsedMs,
-      elapsedText,
-      activeSinceMs: null,
-      activeDurationText: null,
-      activeScope: null,
-      waitingSinceMs: null,
-      waitingDurationText: null,
-      latestEvent: null,
-      activityLabel: null,
-      snapshotState: state.snapshotState,
-      snapshotError: null,
-      snapshotProblemText: null,
-      statusLabel: null,
-    };
-  }
 
   let kind: SubagentStatusKind;
   let statusLabel: string | null = null;
@@ -373,7 +407,10 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
     } else {
       const referenceMs = state.firstObservationAtMs ?? state.startTimeMs;
       const elapsedSinceObservationMs = Math.max(0, now - referenceMs);
-      kind = elapsedSinceObservationMs >= SNAPSHOT_STALLED_AFTER_MS ? "stalled" : "starting";
+      kind =
+        elapsedSinceObservationMs >= SNAPSHOT_STALLED_AFTER_MS
+          ? "stalled"
+          : "starting";
       statusLabel = null;
     }
   } else {
@@ -382,15 +419,18 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
     statusLabel = classified.statusLabel;
   }
 
-  const activeDurationText = state.activeSinceMs == null
-    ? null
-    : formatElapsedDuration(now - state.activeSinceMs);
-  const waitingDurationText = state.waitingSinceMs == null
-    ? null
-    : formatElapsedDuration(now - state.waitingSinceMs);
-  const snapshotProblemText = state.snapshotProblemSinceMs == null
-    ? null
-    : formatElapsedDuration(now - state.snapshotProblemSinceMs);
+  const activeDurationText =
+    state.activeSinceMs == null
+      ? null
+      : formatElapsedDuration(now - state.activeSinceMs);
+  const waitingDurationText =
+    state.waitingSinceMs == null
+      ? null
+      : formatElapsedDuration(now - state.waitingSinceMs);
+  const snapshotProblemText =
+    state.snapshotProblemSinceMs == null
+      ? null
+      : formatElapsedDuration(now - state.snapshotProblemSinceMs);
 
   return {
     kind,
@@ -422,7 +462,8 @@ export function advanceStatusState(
   const transition =
     state.currentKind !== "stalled" && snapshot.kind === "stalled"
       ? "stalled"
-      : state.currentKind === "stalled" && (snapshot.kind === "active" || snapshot.kind === "waiting")
+      : state.currentKind === "stalled" &&
+          (snapshot.kind === "active" || snapshot.kind === "waiting")
         ? "recovered"
         : null;
 
@@ -439,27 +480,38 @@ export function advanceStatusState(
 function formatActiveDetail(snapshot: StatusSnapshot): string {
   const label = activityLabel(snapshot);
   if (!label) return "active";
-  const duration = snapshot.activeDurationText ? ` ${snapshot.activeDurationText}` : "";
+  const duration = snapshot.activeDurationText
+    ? ` ${snapshot.activeDurationText}`
+    : "";
   return `active (${label}${duration})`;
 }
 
 function formatWaitingDetail(snapshot: StatusSnapshot): string {
-  const duration = snapshot.waitingDurationText ? ` ${snapshot.waitingDurationText}` : "";
+  const duration = snapshot.waitingDurationText
+    ? ` ${snapshot.waitingDurationText}`
+    : "";
   return `waiting${duration}`;
 }
 
 function formatStalledDetail(snapshot: StatusSnapshot): string {
   const detail = snapshot.statusLabel ? ` (${snapshot.statusLabel})` : "";
-  const duration = snapshot.snapshotProblemText ? ` ${snapshot.snapshotProblemText}` : "";
+  const duration = snapshot.snapshotProblemText
+    ? ` ${snapshot.snapshotProblemText}`
+    : "";
   return `stalled${duration}${detail}`;
 }
 
-export function formatStatusLine(name: string, snapshot: StatusSnapshot): string {
+export function formatStatusLine(
+  name: string,
+  snapshot: StatusSnapshot,
+): string {
   const boundedName = normalizeStatusName(name);
 
   if (snapshot.kind === "starting") {
     const label = snapshot.statusLabel ? ` (${snapshot.statusLabel})` : "";
-    return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, starting${label}.`);
+    return boundStatusLine(
+      `${boundedName} running ${snapshot.elapsedText}, starting${label}.`,
+    );
   }
 
   if (snapshot.kind === "running") {
@@ -467,19 +519,26 @@ export function formatStatusLine(name: string, snapshot: StatusSnapshot): string
   }
 
   if (snapshot.kind === "active") {
-    return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, ${formatActiveDetail(snapshot)}.`);
+    return boundStatusLine(
+      `${boundedName} running ${snapshot.elapsedText}, ${formatActiveDetail(snapshot)}.`,
+    );
   }
 
   if (snapshot.kind === "waiting") {
-    const problem = snapshot.statusLabel && snapshot.statusLabel !== "done"
-      ? ` (${snapshot.statusLabel})`
-      : snapshot.statusLabel === "done"
-        ? " (done)"
-        : "";
-    return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, ${formatWaitingDetail(snapshot)}${problem}.`);
+    const problem =
+      snapshot.statusLabel && snapshot.statusLabel !== "done"
+        ? ` (${snapshot.statusLabel})`
+        : snapshot.statusLabel === "done"
+          ? " (done)"
+          : "";
+    return boundStatusLine(
+      `${boundedName} running ${snapshot.elapsedText}, ${formatWaitingDetail(snapshot)}${problem}.`,
+    );
   }
 
-  return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, ${formatStalledDetail(snapshot)}.`);
+  return boundStatusLine(
+    `${boundedName} running ${snapshot.elapsedText}, ${formatStalledDetail(snapshot)}.`,
+  );
 }
 
 export function formatTransitionLine(
@@ -490,14 +549,22 @@ export function formatTransitionLine(
   const boundedName = normalizeStatusName(name);
 
   if (transition === "recovered") {
-    const detail = snapshot.kind === "waiting" ? formatWaitingDetail(snapshot) : formatActiveDetail(snapshot);
-    return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, recovered; ${detail}.`);
+    const detail =
+      snapshot.kind === "waiting"
+        ? formatWaitingDetail(snapshot)
+        : formatActiveDetail(snapshot);
+    return boundStatusLine(
+      `${boundedName} running ${snapshot.elapsedText}, recovered; ${detail}.`,
+    );
   }
 
   return formatStatusLine(boundedName, snapshot);
 }
 
-export function capStatusLines(lines: string[], lineLimit: number): CappedStatusLines {
+export function capStatusLines(
+  lines: string[],
+  lineLimit: number,
+): CappedStatusLines {
   const visibleLines = lines.slice(0, lineLimit);
   return {
     visibleLines,
@@ -505,7 +572,10 @@ export function capStatusLines(lines: string[], lineLimit: number): CappedStatus
   };
 }
 
-export function formatStatusAggregate(lines: string[], lineLimit: number): string {
+export function formatStatusAggregate(
+  lines: string[],
+  lineLimit: number,
+): string {
   const { visibleLines, overflow } = capStatusLines(lines, lineLimit);
   const bulletLines = visibleLines.map((line) => `• ${line}`);
   if (overflow > 0) bulletLines.push(`• +${overflow} more running.`);

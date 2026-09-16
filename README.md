@@ -1,12 +1,12 @@
 # pi-interactive-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
+Async subagents for [pi](https://github.com/badlogic/pi-mono), running in [Herdr](https://herdr.dev) panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
-**tmux-only fork.** See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
+**Herdr fork — Windows and macOS.** See [Acknowledgements](#acknowledgements) for the upstream project, which targets tmux, cmux, zellij, and WezTerm.
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own tmux pane — a right split off the parent pi pane, so pane creation never steals keyboard focus. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns immediately. The sub-agent runs in its own Herdr pane — a right split off the parent pi pane, so pane creation never steals keyboard focus. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -17,19 +17,26 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). The layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
+Herdr owns pane layout — the extension never rebalances splits. Herdr's own guidance applies: split right when the pane is wide, down when it is narrow. Repeated right splits can produce narrow columns, so close finished sub-agent panes as they complete.
 
-If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
+### Supported shells
 
-```bash
-export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
-```
+Launch commands are rendered per shell family, and the extension verifies that the shell Herdr actually started in the pane matches the family it rendered for:
+
+| Pane shell | Family | Rendered as |
+| --- | --- | --- |
+| macOS `zsh` / `bash` | POSIX | `.sh` launch script, `printf` sentinel |
+| Windows PowerShell / `pwsh` | PowerShell | `.ps1` launch script, braced sentinel |
+
+Set `PI_SUBAGENT_SHELL` to force a family (`zsh`, `bash`, `sh`, `powershell`, `pwsh`, or a full path to one of them). Without it, macOS uses `$SHELL` when it is zsh or bash, and Windows uses PowerShell.
+
+The pane's shell must match the resolved family. If they differ, the spawn fails before anything is typed, with an actionable mismatch error — fix the pane's shell (for example Herdr's `terminal.default_shell` setting) or set `PI_SUBAGENT_SHELL` to match it.
 
 ## Tools
 
 | Tool | Description |
 | --- | --- |
-| `subagent` | Spawn a sub-agent in a dedicated tmux pane (async) |
+| `subagent` | Spawn a sub-agent in a dedicated Herdr pane (async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
@@ -59,7 +66,7 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 subagent_message({ name: "scout", message: "Also check the auth middleware" });
 ```
 
-- **Running** — the message is typed into the live pane (newlines flattened) and picked up at the next turn boundary. The call returns immediately; the eventual completion still arrives as a steer message.
+- **Running** — the message is submitted through Herdr's agent layer and picked up at the next turn boundary (line breaks preserved, so a multi-line message arrives as one turn). If the sub-agent is blocked at a question, steering reports that instead of typing into the dialog. The call returns immediately; the eventual completion still arrives as a steer message.
 - **Finished** — the session is resumed with the message as the follow-up task, like a fresh spawn: fire-and-forget, always autonomous, result steered back later. The resumed run reclaims its original name.
 
 Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.
@@ -117,7 +124,6 @@ You are a specialized agent that does X...
 | `interactive` | boolean | Whether stall/recovery transitions wake the parent (see below) |
 | `cwd` | string | Default working directory |
 | `disable-model-invocation` | boolean | Hide from `subagents_list`; still spawnable by explicit name |
-| `cli` | string | `claude` runs the agent via the Claude Code CLI instead of pi |
 
 ### session-mode
 
@@ -178,11 +184,25 @@ Status display is configured via `config.json` in the extension directory (copy 
 ## Requirements
 
 - [pi](https://github.com/badlogic/pi-mono)
-- [tmux](https://github.com/tmux/tmux)
+- [Herdr](https://herdr.dev) 0.9.0 or newer (protocol 22+), on Windows or macOS
+
+Install Herdr, start it, then run pi **inside a Herdr pane**:
 
 ```bash
-tmux new -A -s pi 'pi'
+herdr        # start the multiplexer
+pi           # then run pi inside a pane — Herdr sets HERDR_ENV and HERDR_PANE_ID for you
 ```
+
+Running pi outside Herdr is refused with a setup hint; the extension never attaches to a session pi was not started in. An older Herdr server is refused with an upgrade message naming the required protocol.
+
+### Integration tests
+
+```bash
+npm test                  # unit suite — no multiplexer required
+npm run test:integration  # surface + lifecycle suites — skipped without a Herdr runtime
+```
+
+The integration suites create a scratch, non-focused Herdr tab per run and close every pane and the tab afterwards, so your view and focus are never disturbed. Model-backed lifecycle scenarios additionally need an authenticated provider for `PI_TEST_MODEL` (default `deepseek/deepseek-flash`) and skip with an actionable reason otherwise.
 
 ## Acknowledgements
 

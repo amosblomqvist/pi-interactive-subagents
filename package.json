@@ -1,7 +1,7 @@
 {
   "name": "pi-interactive-subagents",
-  "version": "3.7.2",
-  "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in tmux",
+  "version": "4.0.0",
+  "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in Herdr panes",
   "keywords": [
     "pi-package"
   ],

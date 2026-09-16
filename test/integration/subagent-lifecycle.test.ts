@@ -1,326 +1,346 @@
 /**
- * Integration tests for the full subagent lifecycle.
+ * Lifecycle tests for subagent orchestration (spec `subagent-orchestration`,
+ * design D4/D11).
  *
- * These tests spawn REAL pi sessions with REAL LLM calls (haiku by default).
- * Each test creates a tmux pane, runs pi with a task that uses the subagent
- * tool, and verifies the outcome via marker files and screen output.
- *
- * Costs: ~$0.01-0.05 per test run (haiku).
- * Duration: ~30-90s per test.
- *
- * Run inside tmux:
- *   tmux new 'npm run test:integration'
- *
- * Configuration:
- *   PI_TEST_MODEL     — model for all pi sessions (default: anthropic/claude-haiku-4-5)
- *   PI_TEST_TIMEOUT   — per-test timeout in ms (default: 120000)
+ * The first suite drives the orchestration watcher against real Herdr panes
+ * with scripted children, so completion, sidecar, cleanup, and persistence
+ * behavior stay verifiable without a model provider. The second suite covers
+ * the readiness-gate/delivery path with a real pi child and is skipped unless
+ * the configured test model's provider is authenticated.
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { createStatusState } from "../../pi-extension/subagents/status.ts";
+import * as subagentsModule from "../../pi-extension/subagents/index.ts";
 import {
-  getAvailableBackends,
-  createTestEnv,
+  SKIP_REASON,
+  assertFocusUnchanged,
   cleanupTestEnv,
-  createTrackedSurface,
-  startPi,
-  waitForScreen,
-  waitForFile,
+  createTestEnv,
+  createTrackedPane,
+  getAvailableBackends,
+  getFocusedPane,
+  runInPane,
   sleep,
+  startPiInPane,
   uniqueId,
-  trackTempFile,
-  readScreen,
-  PI_TIMEOUT,
+  waitForFile,
   type TestEnv,
 } from "./harness.ts";
+import {
+  closeHerdrPane,
+  listHerdrPanes,
+} from "../../pi-extension/subagents/herdr.ts";
 
-const backends = getAvailableBackends();
+const available = getAvailableBackends().length > 0;
+const testApi = (subagentsModule as any).__test__ as any;
 
-if (backends.length === 0) {
-  console.log("⚠️  tmux is not available — skipping subagent lifecycle integration tests");
-  console.log("   Run inside tmux to enable these tests.");
+const TEST_MODEL = process.env.PI_TEST_MODEL ?? "deepseek/deepseek-flash";
+
+/**
+ * True when the configured test model's provider is authenticated.
+ *
+ * `shell: true` is required on Windows: `pi` is a `.cmd` shim and Node cannot
+ * spawn it directly (ENOENT). The node directory is tried as a fallback so the
+ * probe also works when a runner does not expose the shim on PATH. The model
+ * string is guarded against shell metacharacters before it reaches the shell.
+ */
+function providerReady(): boolean {
+  if (!/^[A-Za-z0-9._/:-]+$/.test(TEST_MODEL)) return false;
+  const candidates = [
+    "pi",
+    join(
+      dirname(process.execPath),
+      process.platform === "win32" ? "pi.cmd" : "pi",
+    ),
+  ];
+  for (const executable of candidates) {
+    try {
+      execFileSync(executable, ["auth", "check", "--model", TEST_MODEL], {
+        stdio: "ignore",
+        shell: true,
+      });
+      return true;
+    } catch {
+      /* try the next candidate */
+    }
+  }
+  return false;
 }
 
-for (const backend of backends) {
-  describe(`subagent-lifecycle [${backend}]`, { timeout: PI_TIMEOUT * 3 }, () => {
-    let env: TestEnv;
+const modelReady = available && providerReady();
+const MODEL_SKIP =
+  `no authenticated provider for ${TEST_MODEL} — set PI_TEST_MODEL to a model ` +
+  `whose provider is logged in to enable model-backed lifecycle tests`;
 
-    before(() => {
-      env = createTestEnv();
-    });
+function makeRunning(env: TestEnv, paneId: string) {
+  const id = uniqueId();
+  const sessionFile = join(env.dir, `child-${id}.jsonl`);
+  writeFileSync(
+    sessionFile,
+    `${JSON.stringify({ type: "session", id: `sess-${id}` })}\n`,
+    "utf8",
+  );
+  return {
+    id,
+    name: `Child-${id}`,
+    task: "scripted task",
+    paneId,
+    startTime: Date.now(),
+    sessionFile,
+    interactive: false,
+    pendingTask: undefined as string | undefined,
+    deliveryMode: undefined as "agent" | "degraded" | undefined,
+    statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+  };
+}
 
-    after(() => {
-      cleanupTestEnv(env);
-    });
+describe("subagent lifecycle — scripted children", {
+  skip: available ? false : SKIP_REASON,
+}, () => {
+  let env: TestEnv;
+  let focusBefore: string | null = null;
 
-    // ── Basic spawn + completion ──
+  before(async () => {
+    env = await createTestEnv("pi-lifecycle");
+    focusBefore = await getFocusedPane();
+  });
 
-    it("spawns a subagent that writes a file and verifies the session", async () => {
-      const id = uniqueId();
-      const markerFile = `/tmp/pi-integ-echo-${id}.txt`;
-      trackTempFile(env, markerFile);
+  after(async () => {
+    await cleanupTestEnv(env);
+  });
 
-      const surface = createTrackedSurface(env, `echo-${id}`);
-      await sleep(1000);
+  it("detects a clean completion, closes the pane, and retains the launch artifact", async () => {
+    const paneId = await createTrackedPane(env);
+    const running = makeRunning(env, paneId);
+    const map = testApi.runningSubagents as Map<string, unknown>;
+    map.set(running.id, running);
 
-      const task = [
-        `Call the subagent tool with these EXACT parameters:`,
-        `  name: "Echo-${id}"`,
-        `  agent: "test-echo"`,
-        `  task: "Run this bash command: echo 'PASS_${id}' > '${markerFile}'"`,
-        `Do not do anything else. Just call the subagent tool once.`,
-        `After you receive the subagent result, say INTEGRATION_COMPLETE.`,
-      ].join("\n");
+    const scriptPath = await runInPane(env, paneId, "exit 0");
+    const result = await testApi.watchSubagent(
+      running,
+      new AbortController().signal,
+    );
 
-      startPi(surface, env.dir, task);
+    assert.equal(result.exitCode, 0);
+    assert.equal(map.has(running.id), false, "the running entry is removed");
+    assert.equal(
+      existsSync(scriptPath),
+      true,
+      "the launch script is retained for debugging",
+    );
+    const panes = (await listHerdrPanes()).map((pane) => pane.pane_id);
+    assert.ok(!panes.includes(paneId), "the pane is closed after completion");
+  });
 
-      // Verify: subagent created the marker file
-      const content = await waitForFile(markerFile, PI_TIMEOUT, /PASS/);
-      assert.ok(
-        content.includes(`PASS_${id}`),
-        `Marker file should contain PASS_${id}. Got: ${content.trim()}`,
+  it("decodes a non-zero exit code", async () => {
+    const paneId = await createTrackedPane(env);
+    const running = makeRunning(env, paneId);
+    (testApi.runningSubagents as Map<string, unknown>).set(running.id, running);
+    await runInPane(env, paneId, "exit 7");
+    const result = await testApi.watchSubagent(
+      running,
+      new AbortController().signal,
+    );
+    assert.equal(result.exitCode, 7);
+  });
+
+  it("lets the error sidecar win over the sentinel and consumes it", async () => {
+    const paneId = await createTrackedPane(env);
+    const running = makeRunning(env, paneId);
+    (testApi.runningSubagents as Map<string, unknown>).set(running.id, running);
+    await runInPane(env, paneId, "exit 0");
+    const sidecar = `${running.sessionFile}.exit`;
+    writeFileSync(
+      sidecar,
+      JSON.stringify({
+        type: "error",
+        errorMessage: "Anthropic 529 overloaded after 3 retries",
+      }),
+      "utf8",
+    );
+
+    const result = await testApi.watchSubagent(
+      running,
+      new AbortController().signal,
+    );
+
+    assert.equal(result.exitCode, 1);
+    assert.equal(
+      result.errorMessage,
+      "Anthropic 529 overloaded after 3 retries",
+    );
+    assert.equal(existsSync(sidecar), false, "the sidecar is consumed");
+  });
+
+  it("terminates a run whose pane disappears", async () => {
+    const paneId = await createTrackedPane(env);
+    const running = makeRunning(env, paneId);
+    const map = testApi.runningSubagents as Map<string, unknown>;
+    map.set(running.id, running);
+
+    const watching = testApi.watchSubagent(
+      running,
+      new AbortController().signal,
+    );
+    await sleep(400);
+    await closeHerdrPane(paneId);
+
+    const result = await watching;
+    assert.match(
+      String(result.error),
+      /disappeared before completion/,
+      "the run reports the missing pane",
+    );
+    assert.equal(map.has(running.id), false, "the running entry is removed");
+  });
+
+  it("honours a late sidecar when the pane disappears", async () => {
+    const paneId = await createTrackedPane(env);
+    const running = makeRunning(env, paneId);
+    (testApi.runningSubagents as Map<string, unknown>).set(running.id, running);
+
+    const watching = testApi.watchSubagent(
+      running,
+      new AbortController().signal,
+    );
+    await sleep(400);
+    writeFileSync(
+      `${running.sessionFile}.exit`,
+      JSON.stringify({ type: "error", errorMessage: "late sidecar" }),
+      "utf8",
+    );
+    await closeHerdrPane(paneId);
+
+    const result = await watching;
+    assert.equal(result.errorMessage, "late sidecar");
+  });
+
+  it("cancels a run: the pane is closed and the entry removed", async () => {
+    const paneId = await createTrackedPane(env);
+    const running = makeRunning(env, paneId);
+    const map = testApi.runningSubagents as Map<string, unknown>;
+    map.set(running.id, running);
+
+    const controller = new AbortController();
+    const watching = testApi.watchSubagent(running, controller.signal);
+    await sleep(300);
+    controller.abort();
+
+    const result = await watching;
+    assert.equal(result.error, "cancelled");
+    assert.equal(map.has(running.id), false);
+    const panes = (await listHerdrPanes()).map((pane) => pane.pane_id);
+    assert.ok(!panes.includes(paneId), "cancellation closes the pane");
+  });
+
+  it("spawns a child: pane created, focus unchanged, child process starts", async () => {
+    const sessionDir = join(env.dir, "sessions");
+    mkdirSync(sessionDir, { recursive: true });
+    const parentSessionFile = join(sessionDir, "parent.jsonl");
+    writeFileSync(
+      parentSessionFile,
+      `${JSON.stringify({ type: "session", id: "parent-1" })}\n`,
+      "utf8",
+    );
+    const ctx = {
+      sessionManager: {
+        getSessionFile: () => parentSessionFile,
+        getSessionId: () => "parent-1",
+        getSessionDir: () => sessionDir,
+      },
+      cwd: env.dir,
+    };
+
+    const running = await testApi.launchSubagent(
+      { agent: "worker", task: "say nothing", name: `Spawn-${uniqueId()}` },
+      ctx,
+    );
+
+    try {
+      assert.ok(running.paneId.includes(":"), "a real pane hosts the child");
+      assert.equal(typeof running.launchScriptFile, "string");
+      assert.equal(
+        existsSync(running.launchScriptFile),
+        true,
+        "the launch script is written to the session artifacts",
       );
+      await assertFocusUnchanged(focusBefore, "after spawn");
 
-      // Verify: outer pi received the subagent result
-      const screen = await waitForScreen(
-        surface,
-        /INTEGRATION_COMPLETE|completed|Sub-agent.*"Echo/i,
-        PI_TIMEOUT,
-      );
-
-      // Verify: session file was created (shown in steer result)
-      const sessionMatch = screen.match(/Session:\s*(\S+\.jsonl)/);
-      if (sessionMatch) {
-        const sessionFile = sessionMatch[1];
-        assert.ok(existsSync(sessionFile), `Subagent session file should exist: ${sessionFile}`);
-
-        const lines = readFileSync(sessionFile, "utf8").trim().split("\n");
-        assert.ok(lines.length >= 2, `Session should have ≥2 entries, got ${lines.length}`);
-
-        const header = JSON.parse(lines[0]);
-        assert.equal(header.type, "session", "First entry should be session header");
-        assert.ok(header.id, "Session header should have an id");
+      // The child process comes up and is recognized as a pi agent.
+      let childUp = false;
+      for (let attempt = 0; attempt < 40 && !childUp; attempt += 1) {
+        const pane = (await listHerdrPanes()).find(
+          (candidate) => candidate.pane_id === running.paneId,
+        );
+        childUp = pane?.agent === "pi";
+        if (!childUp) await sleep(500);
       }
-    });
-
-    // ── In-progress activity snapshots ──
-
-    it("keeps a long active tool call from surfacing false stalled status", async () => {
-      const id = uniqueId();
-      const startFile = `/tmp/pi-integ-status-start-${id}.txt`;
-      const markerFile = `/tmp/pi-integ-status-${id}.txt`;
-      trackTempFile(env, startFile);
-      trackTempFile(env, markerFile);
-
-      const surface = createTrackedSurface(env, `status-${id}`);
-      await sleep(1000);
-
-      const task = [
-        `Call the subagent tool with these EXACT parameters:`,
-        `  name: "Status-${id}"`,
-        `  agent: "test-echo"`,
-        `  task: "Run this bash command: echo 'START_${id}' > '${startFile}'; sleep 90; echo 'STATUS_${id}' > '${markerFile}'"`,
-        `Do not do anything else. Just call the subagent tool once.`,
-        `After you receive the subagent result, say STATUS_TEST_DONE.`,
-      ].join("\n");
-
-      startPi(surface, env.dir, task);
-
-      const activeScreen = await waitForScreen(surface, /active[\s\S]*bash|bash[\s\S]*active/i, PI_TIMEOUT, 300);
-      assert.doesNotMatch(activeScreen, /Subagent status[\s\S]*stalled|stalled[\s\S]*Subagent status/i);
-
-      await waitForFile(startFile, PI_TIMEOUT, /START_/);
-      assert.equal(existsSync(markerFile), false, "Completion marker should not exist before the long sleep");
-      await sleep(65_000);
-      assert.equal(existsSync(markerFile), false, "Completion marker should not exist before the watchdog assertion");
-      const watchdogScreen = readScreen(surface, 300);
-      assert.doesNotMatch(watchdogScreen, /Subagent status[\s\S]*stalled|stalled[\s\S]*Subagent status/i);
-
-      const content = await waitForFile(markerFile, PI_TIMEOUT, /STATUS_/);
-      assert.ok(content.includes(`STATUS_${id}`), `Marker file should contain STATUS_${id}`);
-
-      const completionScreen = await waitForScreen(
-        surface,
-        /STATUS_TEST_DONE|completed|Sub-agent.*"Status-/i,
-        PI_TIMEOUT,
-        300,
+      assert.equal(
+        childUp,
+        true,
+        "the spawned pi child is detected in its pane",
       );
-      assert.ok(/STATUS_TEST_DONE|completed/i.test(completionScreen));
-    });
+    } finally {
+      (testApi.runningSubagents as Map<string, unknown>).delete(running.id);
+      await closeHerdrPane(running.paneId).catch(() => {
+        /* the pane may already be gone */
+      });
+    }
+  });
 
-    // ── Parallel subagent spawn ──
+  it("keeps the user's focus unchanged throughout", async () => {
+    await assertFocusUnchanged(focusBefore, "after lifecycle runs");
+  });
+});
 
-    it("spawns two subagents in parallel and both complete", async () => {
-      const id = uniqueId();
-      const fileA = `/tmp/pi-integ-para-${id}-a.txt`;
-      const fileB = `/tmp/pi-integ-para-${id}-b.txt`;
-      trackTempFile(env, fileA);
-      trackTempFile(env, fileB);
+describe("subagent lifecycle — model-backed readiness gate", {
+  skip: modelReady ? false : MODEL_SKIP,
+}, () => {
+  let env: TestEnv;
 
-      const surface = createTrackedSurface(env, `parallel-${id}`);
-      await sleep(1000);
+  before(async () => {
+    env = await createTestEnv("pi-lifecycle-model");
+  });
 
-      const task = [
-        `You must call the subagent tool TWICE. Make both calls before waiting for results.`,
-        ``,
-        `First call:`,
-        `  name: "ParaA-${id}"`,
-        `  agent: "test-echo"`,
-        `  task: "Run: echo 'DONE_A_${id}' > '${fileA}'"`,
-        ``,
-        `Second call:`,
-        `  name: "ParaB-${id}"`,
-        `  agent: "test-echo"`,
-        `  task: "Run: echo 'DONE_B_${id}' > '${fileB}'"`,
-        ``,
-        `Call both subagent tools NOW, do not wait between them.`,
-      ].join("\n");
+  after(async () => {
+    await cleanupTestEnv(env);
+  });
 
-      startPi(surface, env.dir, task);
+  it("delivers the composed task to a real pi child once it reports ready", async () => {
+    const paneId = await createTrackedPane(env);
+    const childSession = join(env.dir, `child-session-${uniqueId()}.jsonl`);
+    // Launch a bare child with its own session file: no task argv, so the
+    // gate's delivery is its first user turn.
+    await startPiInPane(env, paneId, "", { sessionFile: childSession });
 
-      // Both marker files should appear
-      const [contentA, contentB] = await Promise.all([
-        waitForFile(fileA, PI_TIMEOUT, /DONE_A/),
-        waitForFile(fileB, PI_TIMEOUT, /DONE_B/),
-      ]);
+    const running = makeRunning(env, paneId);
+    running.pendingTask =
+      "Integration gate probe: reply with the single word READY.";
+    const controller = new AbortController();
+    const watching = testApi.watchSubagent(running, controller.signal);
 
-      assert.ok(contentA.includes(`DONE_A_${id}`), `File A should contain marker`);
-      assert.ok(contentB.includes(`DONE_B_${id}`), `File B should contain marker`);
-    });
+    // The child's own transcript is the delivery oracle. The pane's plain
+    // text buffer is not reliable for a TUI child — it redraws and scrolls,
+    // so an early assertion there would race the child's rendering.
+    const transcript = await waitForFile(
+      childSession,
+      120_000,
+      /Integration gate probe/,
+    );
+    assert.match(transcript, /Integration gate probe/);
+    assert.equal(
+      running.deliveryMode,
+      "agent",
+      "the task must go through the agent layer, not the degraded transport",
+    );
 
-    // ── Fork mode ──
-
-    it("fork mode creates a child session linked to the parent", async () => {
-      const id = uniqueId();
-      const markerFile = `/tmp/pi-integ-fork-${id}.txt`;
-      trackTempFile(env, markerFile);
-
-      const surface = createTrackedSurface(env, `fork-${id}`);
-      await sleep(1000);
-
-      const task = [
-        `Call the subagent tool with these EXACT parameters:`,
-        `  name: "Fork-${id}"`,
-        `  fork: true`,
-        `  task: "Run this bash command: echo 'FORK_OK_${id}' > '${markerFile}'"`,
-        `Do not set the agent parameter. Just set name, fork, and task.`,
-        `After you receive the result, say FORK_COMPLETE.`,
-      ].join("\n");
-
-      startPi(surface, env.dir, task);
-
-      // Verify: forked subagent created the file
-      const content = await waitForFile(markerFile, PI_TIMEOUT, /FORK_OK/);
-      assert.ok(content.includes(`FORK_OK_${id}`), `Fork marker file should exist with content`);
-
-      // Wait for the outer pi to show the result
-      const screen = await waitForScreen(
-        surface,
-        /FORK_COMPLETE|completed|Sub-agent.*"Fork/i,
-        PI_TIMEOUT,
-      );
-
-      // Verify: the forked session has a parent link
-      const sessionMatch = screen.match(/Session:\s*(\S+\.jsonl)/);
-      if (sessionMatch) {
-        const sessionFile = sessionMatch[1];
-        assert.ok(existsSync(sessionFile), `Fork session file should exist: ${sessionFile}`);
-
-        const entries = readFileSync(sessionFile, "utf8")
-          .trim()
-          .split("\n")
-          .map((l) => JSON.parse(l));
-        const header = entries[0];
-        assert.equal(header.type, "session", "First entry should be session header");
-        assert.ok(header.parentSession, "Fork session should have parentSession field");
-        // Fork sessions include parent context (model_change entries etc.)
-        assert.ok(entries.length >= 2, "Fork session should have context entries beyond header");
-      }
-    });
-
-    // ── caller_ping ──
-
-    it("subagent caller_ping sends notification back to the parent", async () => {
-      const id = uniqueId();
-
-      const surface = createTrackedSurface(env, `ping-${id}`);
-      await sleep(1000);
-
-      const task = [
-        `Call the subagent tool with these EXACT parameters:`,
-        `  name: "Ping-${id}"`,
-        `  agent: "test-ping"`,
-        `  task: "PING_TEST_${id}"`,
-        `Just call the subagent tool once. Do not do anything else before calling it.`,
-      ].join("\n");
-
-      startPi(surface, env.dir, task);
-
-      // The test-ping agent calls caller_ping, which steers a "needs help" message
-      // back to the outer pi. Look for it on screen.
-      const screen = await waitForScreen(
-        surface,
-        /needs help|PING|caller_ping|ping/i,
-        PI_TIMEOUT,
-      );
-
-      assert.ok(
-        /needs help|PING/i.test(screen),
-        `Screen should show ping notification. Got:\n${screen.slice(-800)}`,
-      );
-    });
-
-    // ── Agent discovery ──
-
-    it("subagent discovers project-local test agents", async () => {
-      const id = uniqueId();
-      const markerFile = `/tmp/pi-integ-discovery-${id}.txt`;
-      trackTempFile(env, markerFile);
-
-      const surface = createTrackedSurface(env, `discovery-${id}`);
-      await sleep(1000);
-
-      // Use subagents_list to verify test agents are discoverable,
-      // then spawn one to prove it works end-to-end.
-      const task = [
-        `First, call the subagents_list tool to see available agents.`,
-        `Then call the subagent tool:`,
-        `  name: "Disco-${id}"`,
-        `  agent: "test-echo"`,
-        `  task: "Run: echo 'DISCO_${id}' > '${markerFile}'"`,
-        `After you receive the subagent result, say DISCOVERY_DONE.`,
-      ].join("\n");
-
-      startPi(surface, env.dir, task);
-
-      // The test-echo agent (discovered from project .pi/agents/) should work
-      const content = await waitForFile(markerFile, PI_TIMEOUT, /DISCO/);
-      assert.ok(content.includes(`DISCO_${id}`), `Discovery test marker should exist`);
-    });
-
-    // ── Subagent with custom system prompt ──
-
-    it("passes systemPrompt to subagent", async () => {
-      const id = uniqueId();
-      const markerFile = `/tmp/pi-integ-sysprompt-${id}.txt`;
-      trackTempFile(env, markerFile);
-
-      const surface = createTrackedSurface(env, `sysprompt-${id}`);
-      await sleep(1000);
-
-      const task = [
-        `Call the subagent tool with these parameters:`,
-        `  name: "SysP-${id}"`,
-        `  agent: "test-echo"`,
-        `  systemPrompt: "Always start your response with CUSTOM_PROMPT_ACTIVE."`,
-        `  task: "Write 'SYSPROMPT_${id}' to ${markerFile} using bash: echo 'SYSPROMPT_${id}' > '${markerFile}'"`,
-        `After the subagent completes, say SYSPROMPT_TEST_DONE.`,
-      ].join("\n");
-
-      startPi(surface, env.dir, task);
-
-      const content = await waitForFile(markerFile, PI_TIMEOUT, /SYSPROMPT/);
-      assert.ok(content.includes(`SYSPROMPT_${id}`), `System prompt test marker should exist`);
+    controller.abort();
+    await watching.catch(() => {
+      /* the run is cancelled deliberately */
     });
   });
-}
+});

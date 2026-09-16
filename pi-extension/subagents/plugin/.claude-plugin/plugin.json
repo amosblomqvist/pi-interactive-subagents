@@ -1,5 +1,0 @@
-{
-  "name": "pi-auto-exit",
-  "version": "1.0.0",
-  "description": "Auto-exit plugin for pi-spawned Claude sessions"
-}
