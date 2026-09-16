@@ -322,11 +322,14 @@ function parseAgentDefinition(
   content: string,
   fallbackName: string,
 ): AgentDefinition | null {
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
+  // Frontmatter delimiters are matched with optional CR so agent files that a
+  // Windows checkout (core.autocrlf) or hand-authored editor wrote with CRLF
+  // are discovered exactly like LF files.
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!match) return null;
 
   const frontmatter = match[1];
-  const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
+  const body = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n*/, "").trim();
   const systemPromptMode = getFrontmatterValue(frontmatter, "system-prompt");
 
   return {
