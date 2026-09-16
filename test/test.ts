@@ -9,7 +9,7 @@ import {
   existsSync,
 } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
@@ -1481,11 +1481,18 @@ describe("subagent discovery", () => {
   it("getToolExtensionPath maps custom tools and skips built-ins", () => {
     assert.equal(testApi.getToolExtensionPath("read"), undefined);
     assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(
-      testApi
-        .getToolExtensionPath("web_search")
-        ?.endsWith("web-search/index.ts"),
-    );
+    // The web tools come from a pi package (pi-web-access) on modern installs;
+    // the legacy agent-config `extensions/web-search` layout is only mapped
+    // when it exists on disk, so assert the shape where the install has it.
+    const agentDir =
+      process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+    if (existsSync(join(agentDir, "extensions", "web-search", "index.ts"))) {
+      assert.ok(
+        testApi
+          .getToolExtensionPath("web_search")
+          ?.endsWith("web-search/index.ts"),
+      );
+    }
     assert.ok(
       testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"),
     );
@@ -2898,6 +2905,75 @@ describe("subagent interruption", () => {
     }
   });
 
+  it("reports a blocked target instead of typing into the dialog", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const running = makeRunning();
+    // A blocked target must be reported before any transport runs; the
+    // scripted runner stays unused (zero calls).
+    const { runner, calls } = scriptedHerdr([{ code: 0, stdout: "{}" }]);
+    await withHerdrRunner(runner, async () => {
+      const result = await testApi.steerSubagent(running, "hi", async () => {
+        throw new HerdrError("agent_blocked", "waiting at a question dialog");
+      });
+      assert.match(result.error, /blocked at a dialog/);
+      assert.match(result.error, /message was not sent/);
+      assert.equal(calls.length, 0, "nothing may be typed into the dialog");
+    });
+  });
+
+  it("degrades a stalled steer once through text + enter", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const running = makeRunning();
+    const { runner, calls } = scriptedHerdr([
+      { code: 0, stdout: "{}" }, // pane send-text
+      { code: 0, stdout: "{}" }, // pane wait-output (echo probe)
+      { code: 0, stdout: "{}" }, // pane send-keys enter
+    ]);
+    await withHerdrRunner(runner, async () => {
+      const result = await testApi.steerSubagent(
+        running,
+        "line one\nline two",
+        async () => {
+          // Herdr documents a stalled submission as input lost — the one
+          // failure that may fall back without risking a double delivery.
+          throw new HerdrError("agent_prompt_stalled", "input lost");
+        },
+      );
+      assert.deepEqual(result, { ok: true, degraded: true });
+      assert.deepEqual(calls[0].slice(1), [
+        "pane",
+        "send-text",
+        "pane-1",
+        "line one\nline two",
+      ]);
+      assert.deepEqual(calls[2].slice(1), [
+        "pane",
+        "send-keys",
+        "pane-1",
+        "enter",
+      ]);
+    });
+  });
+
+  it("reports an unknown target without sending any pane input", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    let delivered = 0;
+    try {
+      const result = await testApi.handleSubagentSteer(
+        { name: "ghost", message: "hi" },
+        async () => {
+          delivered += 1;
+        },
+      );
+      assert.match(result.details.error, /No running subagent named "ghost"/);
+      assert.equal(delivered, 0, "no transport may run for an unknown target");
+    } finally {
+      runningMap.clear();
+    }
+  });
+
   it("formats exit code 130 as an ordinary failure", () => {
     const testApi = (subagentsModule as any).__test__;
     const presentation = testApi.resolveResultPresentation(
@@ -4148,5 +4224,196 @@ describe("pending question sidecar", () => {
       map.clear();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("task delivery gate", () => {
+  function makeGateRunning(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "gate-1",
+      name: "GateChild",
+      task: "the task",
+      paneId: "w1:p5",
+      startTime: 0,
+      sessionFile: join(tmpdir(), "gate-nonexistent.jsonl"),
+      interactive: false,
+      pendingTask: "composed task",
+      deliveryMode: undefined as "agent" | "degraded" | undefined,
+      statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+      ...overrides,
+    };
+  }
+
+  it("withholds the task until the child reports ready, then delivers it once", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const states: string[] = ["unknown", "unknown", "working", "idle"];
+    const prompts: string[] = [];
+    const running = makeGateRunning();
+
+    await testApi.deliverTaskWhenReady(running, new AbortController().signal, {
+      readState: async () => (states.shift() ?? "unknown") as any,
+      prompt: async (_paneId: string, text: string) => {
+        prompts.push(text);
+      },
+      fallback: async () => {
+        throw new Error("the fallback must not run for a ready child");
+      },
+      pollMs: 1,
+      gateTimeoutMs: 5_000,
+    });
+
+    assert.deepEqual(prompts, ["composed task"]);
+    assert.equal(
+      states.length,
+      0,
+      "every pre-ready state is observed, never assumed ready",
+    );
+    assert.equal(running.deliveryMode, "agent");
+  });
+
+  it("degrades once through the alternate transport when the gate expires", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const delivered: string[] = [];
+    const running = makeGateRunning();
+    let prompts = 0;
+
+    await testApi.deliverTaskWhenReady(running, new AbortController().signal, {
+      readState: async () => "unknown" as any,
+      prompt: async () => {
+        prompts += 1;
+      },
+      fallback: async (_paneId: string, text: string) => {
+        delivered.push(text);
+      },
+      pollMs: 5,
+      gateTimeoutMs: 40,
+    });
+
+    assert.equal(prompts, 0, "no input may be typed before readiness");
+    assert.deepEqual(delivered, ["composed task"]);
+    assert.equal(running.deliveryMode, "degraded");
+  });
+
+  it("degrades once when the agent layer reports the prompt stalled", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const delivered: string[] = [];
+    const running = makeGateRunning();
+
+    await testApi.deliverTaskWhenReady(running, new AbortController().signal, {
+      readState: async () => "idle" as any,
+      prompt: async () => {
+        throw new HerdrError("agent_prompt_stalled", "input lost");
+      },
+      fallback: async (_paneId: string, text: string) => {
+        delivered.push(text);
+      },
+    });
+
+    assert.deepEqual(delivered, ["composed task"]);
+    assert.equal(running.deliveryMode, "degraded");
+  });
+
+  it("treats an ambiguous timeout as delivered when the turn started", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const states: string[] = ["idle", "working"];
+    const running = makeGateRunning();
+
+    await testApi.deliverTaskWhenReady(running, new AbortController().signal, {
+      readState: async () => (states.shift() ?? "unknown") as any,
+      prompt: async () => {
+        throw new HerdrError("timeout", "prompt timed out");
+      },
+      fallback: async () => {
+        throw new Error("an ambiguous timeout must never re-send the task");
+      },
+    });
+
+    assert.equal(running.deliveryMode, "agent");
+  });
+
+  it("fails without re-sending when an ambiguous timeout started no turn", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const states: string[] = ["idle", "unknown"];
+    const running = makeGateRunning();
+
+    await assert.rejects(
+      () =>
+        testApi.deliverTaskWhenReady(running, new AbortController().signal, {
+          readState: async () => (states.shift() ?? "unknown") as any,
+          prompt: async () => {
+            throw new HerdrError("timeout", "prompt timed out");
+          },
+          fallback: async () => {
+            throw new Error("an ambiguous timeout must never re-send the task");
+          },
+        }),
+      /timed out before its turn started/,
+    );
+    assert.equal(running.deliveryMode, undefined);
+  });
+
+  it("reports a blocked dialog and sends nothing", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const running = makeGateRunning();
+    let sent = 0;
+
+    await assert.rejects(
+      () =>
+        testApi.deliverTaskWhenReady(running, new AbortController().signal, {
+          readState: async () => "blocked" as any,
+          prompt: async () => {
+            sent += 1;
+          },
+          fallback: async () => {
+            sent += 1;
+          },
+        }),
+      /blocked at a dialog/,
+    );
+    assert.equal(sent, 0, "nothing may be typed into a blocked dialog");
+  });
+
+  it("reports agent_blocked from the prompt without falling back", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const running = makeGateRunning();
+    let sent = 0;
+
+    await assert.rejects(
+      () =>
+        testApi.deliverTaskWhenReady(running, new AbortController().signal, {
+          readState: async () => "idle" as any,
+          prompt: async () => {
+            throw new HerdrError("agent_blocked", "dialog open");
+          },
+          fallback: async () => {
+            sent += 1;
+          },
+        }),
+      /blocked at a dialog/,
+    );
+    assert.equal(sent, 0);
+    assert.equal(running.deliveryMode, undefined);
+  });
+
+  it("does nothing when no task is pending", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const running = makeGateRunning({ pendingTask: undefined });
+    let calls = 0;
+
+    await testApi.deliverTaskWhenReady(running, new AbortController().signal, {
+      readState: async () => {
+        calls += 1;
+        return "idle" as any;
+      },
+      prompt: async () => {
+        calls += 1;
+      },
+      fallback: async () => {
+        calls += 1;
+      },
+    });
+
+    assert.equal(calls, 0);
+    assert.equal(running.deliveryMode, undefined);
   });
 });

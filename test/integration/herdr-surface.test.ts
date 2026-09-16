@@ -1,12 +1,16 @@
 /**
  * Surface tests for the Herdr pane adapter (design D12).
  *
- * Every test runs inside a scratch, non-focused tab so the user's view and
- * focus never move. Waits use Herdr's own oracles (`pane wait-output`), not
- * fixed sleeps. The suite skips cleanly when the runtime is unavailable, and
- * its after-hook asserts the scratch tab and every pane are gone.
+ * Every test runs inside its own scratch, non-focused tab so the user's view
+ * and focus never move. A fresh tab per test also keeps geometry deterministic:
+ * each tracked pane is a right split of the tab's root pane, and Herdr's split
+ * ratio halves the split target, so reusing one tab across tests would shrink
+ * later panes toward zero columns (Herdr owns layout; the extension does not
+ * rebalance). Waits use Herdr's own oracles (`pane wait-output`), not fixed
+ * sleeps. The suite skips cleanly when the runtime is unavailable, and its
+ * after-each hook asserts the scratch tab and every pane are gone.
  */
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync } from "node:fs";
 import { basename, join } from "node:path";
@@ -46,6 +50,8 @@ import {
   waitHerdrOutput,
 } from "../../pi-extension/subagents/herdr.ts";
 import {
+  SUBAGENT_DONE_WAIT_REGEX,
+  parseSentinelExitCode,
   quoteArg,
   resolveShellSpec,
 } from "../../pi-extension/subagents/shell.ts";
@@ -59,11 +65,14 @@ describe("herdr surface adapter", {
   let focusBefore: string | null = null;
 
   before(async () => {
-    env = await createTestEnv("pi-herdr-surface");
     focusBefore = await getFocusedPane();
   });
 
-  after(async () => {
+  beforeEach(async () => {
+    env = await createTestEnv("pi-herdr-surface");
+  });
+
+  afterEach(async () => {
     await cleanupTestEnv(env);
 
     // The dry-run oracle: nothing this environment created may survive.
@@ -211,6 +220,29 @@ describe("herdr surface adapter", {
     await runInPane(env, paneId, "exit 1073741824");
     const expected = spec.kind === "powershell" ? 1073741824 : 1073741824 % 256;
     assert.equal(await waitForSentinel(paneId), expected);
+  });
+
+  it("detects completion in a crowded (narrow) pane using the runtime's read budgets", async () => {
+    // Herdr owns layout and the extension never rebalances: each spawn is a
+    // right split of the pane it targets, so repeated splits leave ~half the
+    // previous width per pane. The runtime must still detect completion there,
+    // reading with a bounded line budget (wait 50 / read 200) where `--lines`
+    // is a rows budget and the leading row can be a partial logical line.
+    let paneId = await createTrackedPane(env);
+    for (let i = 0; i < 4; i += 1) {
+      paneId = await createTrackedPane(env, { targetPane: paneId });
+    }
+    await runInPane(env, paneId, "exit 9");
+    await waitHerdrOutput(paneId, SUBAGENT_DONE_WAIT_REGEX, {
+      lines: 50,
+      timeoutMs: 30_000,
+    });
+    const text = await readHerdrPane(paneId, 200);
+    assert.equal(
+      parseSentinelExitCode(text),
+      9,
+      `exit code must survive a narrow pane; tail: ${text.slice(-300)}`,
+    );
   });
 
   it("validates the pane's real shell family through process-info", async () => {

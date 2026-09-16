@@ -11,10 +11,11 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createStatusState } from "../../pi-extension/subagents/status.ts";
 import * as subagentsModule from "../../pi-extension/subagents/index.ts";
+import { registerName } from "../../pi-extension/subagents/session.ts";
 import {
   SKIP_REASON,
   assertFocusUnchanged,
@@ -28,12 +29,20 @@ import {
   startPiInPane,
   uniqueId,
   waitForFile,
+  waitForPaneOutput,
   type TestEnv,
 } from "./harness.ts";
 import {
   closeHerdrPane,
+  getHerdrAgent,
   listHerdrPanes,
+  readHerdrPane,
+  type HerdrAgentState,
 } from "../../pi-extension/subagents/herdr.ts";
+import {
+  quoteArg,
+  resolveShellSpec,
+} from "../../pi-extension/subagents/shell.ts";
 
 const available = getAvailableBackends().length > 0;
 const testApi = (subagentsModule as any).__test__ as any;
@@ -292,6 +301,67 @@ describe("subagent lifecycle — scripted children", {
     }
   });
 
+  it("degrades to text + enter when the pane never hosts a ready agent", async () => {
+    // A bare shell pane never reports an agent state, so the readiness gate
+    // expires and the one degraded transport delivers the pending task.
+    const paneId = await createTrackedPane(env);
+    const running = makeRunning(env, paneId);
+    const unique = uniqueId();
+    const spec = resolveShellSpec();
+    const left = "degraded-";
+    const right = `probe-${unique}`;
+    // Both families print the two halves joined; the typed command text only
+    // ever contains them separately.
+    running.pendingTask =
+      spec.kind === "powershell"
+        ? `Write-Output (${quoteArg(spec.kind, left)} + ${quoteArg(spec.kind, right)})`
+        : `printf '%s%s\\n' ${quoteArg(spec.kind, left)} ${quoteArg(spec.kind, right)}`;
+    const controller = new AbortController();
+    const watching = testApi.watchSubagent(running, controller.signal);
+
+    try {
+      // The joined marker exists only in the command's OUTPUT — the typed
+      // command text contains the two halves separately, so a single
+      // occurrence proves the task was delivered exactly once.
+      const marker = `degraded-probe-${unique}`;
+      await waitForPaneOutput(paneId, marker, 60_000);
+      assert.equal(
+        running.deliveryMode,
+        "degraded",
+        "the gate expiry must be reported as degraded delivery",
+      );
+      const text = await readHerdrPane(paneId, 100);
+      const occurrences = text.split(marker).length - 1;
+      assert.equal(
+        occurrences,
+        1,
+        `the task must be delivered exactly once, saw ${occurrences}`,
+      );
+    } finally {
+      controller.abort();
+      await watching.catch(() => {
+        /* the run is cancelled deliberately */
+      });
+    }
+  });
+
+  it("reports a steer to a pane with no agent instead of typing into it", async () => {
+    const paneId = await createTrackedPane(env);
+    const running = makeRunning(env, paneId);
+    const marker = `steer-${uniqueId()}`;
+
+    const result = await testApi.steerSubagent(running, `echo ${marker}`);
+
+    assert.ok("error" in result, "the failure is reported, not assumed sent");
+    assert.match(result.error, /Failed to deliver message/);
+    await sleep(300);
+    const text = await readHerdrPane(paneId, 50);
+    assert.ok(
+      !text.includes(marker),
+      "a failed agent-layer steer must not be typed into the pane",
+    );
+  });
+
   it("keeps the user's focus unchanged throughout", async () => {
     await assertFocusUnchanged(focusBefore, "after lifecycle runs");
   });
@@ -342,5 +412,405 @@ describe("subagent lifecycle — model-backed readiness gate", {
     await watching.catch(() => {
       /* the run is cancelled deliberately */
     });
+  });
+});
+
+// ── Model-backed lifecycle helpers ──
+
+/**
+ * User turns recorded in a child's session transcript, one string per turn.
+ * A turn is one JSONL message entry with `role: "user"`; the text blocks of
+ * that entry are concatenated so multi-line submissions stay one turn.
+ */
+function readUserTurns(sessionFile: string): string[] {
+  if (!existsSync(sessionFile)) return [];
+  const turns: string[] = [];
+  for (const line of readFileSync(sessionFile, "utf8").split("\n")) {
+    if (!line.trim()) continue;
+    let entry: any;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (entry?.type !== "message" || entry?.message?.role !== "user") continue;
+    const text = (entry.message.content ?? [])
+      .filter((block: any) => block?.type === "text")
+      .map((block: any) => block.text ?? "")
+      .join("");
+    if (text) turns.push(text);
+  }
+  return turns;
+}
+
+/** Poll Herdr's agent state until it reports one of the wanted states. */
+async function waitForAgentState(
+  paneId: string,
+  wanted: HerdrAgentState[],
+  timeout = 90_000,
+): Promise<HerdrAgentState> {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    const state = await getHerdrAgent(paneId).catch(
+      () => "unknown" as HerdrAgentState,
+    );
+    if (wanted.includes(state)) return state;
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `Timeout (${timeout}ms) waiting for agent state ${wanted.join("/")} in ${paneId}; last state ${state}`,
+      );
+    }
+    await sleep(500);
+  }
+}
+
+/** Wait until a pane no longer appears in Herdr's pane list. */
+async function waitForPaneGone(
+  paneId: string,
+  timeout = 60_000,
+): Promise<void> {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    const panes = (await listHerdrPanes()).map((pane) => pane.pane_id);
+    if (!panes.includes(paneId)) return;
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `Timeout (${timeout}ms) waiting for pane ${paneId} to close`,
+      );
+    }
+    await sleep(250);
+  }
+}
+
+/** Minimal ExtensionAPI double: captures registered tools and sent messages. */
+function createMockPi() {
+  const tools: Array<any> = [];
+  const sentMessages: Array<any> = [];
+  const api = {
+    on() {},
+    registerTool(tool: any) {
+      tools.push(tool);
+    },
+    registerCommand() {},
+    registerMessageRenderer() {},
+    registerShortcut() {},
+    sendUserMessage() {},
+    sendMessage(message: any, options?: any) {
+      sentMessages.push({ message, options });
+    },
+    getAllTools() {
+      return [];
+    },
+  } as any;
+  return { api, tools, sentMessages };
+}
+
+/** Wait for a captured pi message matching the predicate. */
+async function waitForMockMessage(
+  messages: Array<any>,
+  predicate: (entry: any) => boolean,
+  timeout = 120_000,
+): Promise<any> {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    const match = messages.find(predicate);
+    if (match) return match;
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `Timeout (${timeout}ms) waiting for an expected orchestrator message; ` +
+          `saw: ${messages.map((m) => m.message?.customType ?? "?").join(", ") || "none"}`,
+      );
+    }
+    await sleep(500);
+  }
+}
+
+function makeOrchestratorCtx(env: TestEnv, sessionId: string) {
+  const sessionDir = join(env.dir, `orchestrator-${sessionId}`);
+  mkdirSync(sessionDir, { recursive: true });
+  const parentSessionFile = join(sessionDir, "parent.jsonl");
+  writeFileSync(
+    parentSessionFile,
+    `${JSON.stringify({ type: "session", id: sessionId })}\n`,
+    "utf8",
+  );
+  return {
+    sessionDir,
+    parentSessionFile,
+    ctx: {
+      sessionManager: {
+        getSessionFile: () => parentSessionFile,
+        getSessionId: () => sessionId,
+        getSessionDir: () => sessionDir,
+      },
+      cwd: env.dir,
+    } as any,
+  };
+}
+
+/** Run a callback with the process cwd set to the test project directory. */
+async function withTestCwd<T>(dir: string, fn: () => Promise<T>): Promise<T> {
+  const previous = process.cwd();
+  process.chdir(dir);
+  try {
+    return await fn();
+  } finally {
+    process.chdir(previous);
+  }
+}
+
+describe("subagent lifecycle — model-backed steering, questions, and resume", {
+  skip: modelReady ? false : MODEL_SKIP,
+}, () => {
+  let env: TestEnv;
+
+  before(async () => {
+    env = await createTestEnv("pi-lifecycle-model");
+  });
+
+  after(async () => {
+    (subagentsModule as any).__test__.stopRefreshTimers?.();
+    await cleanupTestEnv(env);
+  });
+
+  it("delivers a multi-line steer to a running pi child as one turn", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const paneId = await createTrackedPane(env);
+    const childSession = join(env.dir, `steer-session-${uniqueId()}.jsonl`);
+    await startPiInPane(env, paneId, "", { sessionFile: childSession });
+
+    const running = makeRunning(env, paneId);
+    running.pendingTask =
+      "Integration steer probe: reply with the single word FIRST.";
+    const controller = new AbortController();
+    const watching = testApi.watchSubagent(running, controller.signal);
+
+    try {
+      // Wait for the first turn to land and the child to settle before steering.
+      await waitForFile(childSession, 120_000, /Integration steer probe/);
+      await waitForAgentState(paneId, ["idle", "done"]);
+
+      const steerText = "Steer probe line one.\nSteer probe line two.";
+      const steer = await testApi.steerSubagent(running, steerText);
+      assert.deepEqual(steer, { ok: true });
+
+      await waitForFile(childSession, 120_000, /Steer probe line two/);
+      const turns = readUserTurns(childSession).filter((turn) =>
+        turn.includes("Steer probe line one"),
+      );
+      assert.equal(
+        turns.length,
+        1,
+        "the steer must arrive as exactly one user turn",
+      );
+      assert.match(
+        turns[0],
+        /Steer probe line one\.\nSteer probe line two\./,
+        "both lines must arrive as one turn with the line break preserved",
+      );
+    } finally {
+      controller.abort();
+      await watching.catch(() => {
+        /* the run is cancelled deliberately */
+      });
+    }
+  });
+
+  it("round-trips a subagent question and resumes the run with the reply", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const mock = createMockPi();
+    (subagentsModule as any).default(mock.api);
+    const { ctx } = makeOrchestratorCtx(env, "question-parent");
+    const name = `Pinger-${uniqueId()}`;
+
+    const spawnTool = mock.tools.find((tool) => tool.name === "subagent");
+    const spawned = await withTestCwd(env.dir, () =>
+      spawnTool.execute(
+        "q-spawn",
+        { agent: "test-ping", task: "What is the secret word?", name },
+        undefined,
+        undefined,
+        ctx,
+      ),
+    );
+    assert.equal(spawned.details.error, undefined, spawned.details.error);
+    const running = (testApi.runningSubagents as Map<string, any>).get(
+      spawned.details.id,
+    );
+    assert.ok(running, "the spawned child is tracked while running");
+
+    // The child asks its question; the watcher notifies the orchestrator once.
+    const question = await waitForMockMessage(
+      mock.sentMessages,
+      (entry) => entry.message?.customType === "subagent_question",
+    );
+    assert.match(question.message.content, /What is the secret word\?/);
+    assert.equal(question.options?.deliverAs, "steer");
+    assert.equal(
+      existsSync(`${running.sessionFile}.ask`),
+      false,
+      "the ask sidecar is consumed after delivery",
+    );
+    const panes = (await listHerdrPanes()).map((pane) => pane.pane_id);
+    assert.ok(
+      panes.includes(running.paneId),
+      "the pane stays open while the question is pending",
+    );
+    assert.equal(
+      (testApi.runningSubagents as Map<string, any>).has(running.id),
+      true,
+      "the session stays parked for the reply",
+    );
+
+    // The reply lands as the child's next turn and the child finishes cleanly.
+    const reply = await testApi.steerSubagent(running, "BLUE");
+    assert.deepEqual(reply, { ok: true });
+    await waitForFile(running.sessionFile, 120_000, /PONG: BLUE/);
+    assert.ok(
+      readUserTurns(running.sessionFile).some((turn) => turn.includes("BLUE")),
+      "the reply is recorded as the child's next user turn",
+    );
+
+    const result = await waitForMockMessage(
+      mock.sentMessages,
+      (entry) =>
+        entry.message?.customType === "subagent_result" &&
+        entry.message?.details?.name === name,
+    );
+    assert.equal(result.message.details.exitCode, 0);
+    await waitForPaneGone(running.paneId);
+  });
+
+  it("resumes a finished subagent by name in a fresh pane with its session and sandbox", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const mock = createMockPi();
+    (subagentsModule as any).default(mock.api);
+    const { ctx } = makeOrchestratorCtx(env, "resume-parent");
+    const name = `Resumer-${uniqueId()}`;
+
+    const spawnTool = mock.tools.find((tool) => tool.name === "subagent");
+    const messageTool = mock.tools.find(
+      (tool) => tool.name === "subagent_message",
+    );
+
+    // Spawn the original run and let it finish on its own (auto-exit agent).
+    const spawned = await withTestCwd(env.dir, () =>
+      spawnTool.execute(
+        "r-spawn",
+        {
+          agent: "test-echo",
+          task: "Write the word ALPHA to alpha.txt, then stop.",
+          name,
+        },
+        undefined,
+        undefined,
+        ctx,
+      ),
+    );
+    assert.equal(spawned.details.error, undefined, spawned.details.error);
+    const sessionFile = spawned.details.sessionFile;
+    const firstRun = (testApi.runningSubagents as Map<string, any>).get(
+      spawned.details.id,
+    );
+    assert.ok(firstRun);
+    const firstPane = firstRun.paneId;
+
+    await waitForMockMessage(
+      mock.sentMessages,
+      (entry) =>
+        entry.message?.customType === "subagent_result" &&
+        entry.message?.details?.name === name,
+    );
+    assert.equal(
+      existsSync(`${sessionFile}.loadout.json`),
+      true,
+      "spawn persisted the sandbox snapshot beside the session",
+    );
+    await waitForPaneGone(firstPane);
+
+    // Resume through the real tool: same name, same session, fresh pane.
+    const resumed = await withTestCwd(env.dir, () =>
+      messageTool.execute(
+        "r-resume",
+        {
+          name,
+          message:
+            "Now write the word BETA to beta.txt and reply with RESUME-OK.",
+        },
+        undefined,
+        undefined,
+        ctx,
+      ),
+    );
+    assert.equal(resumed.details.status, "started");
+    assert.equal(resumed.details.name, name, "the run reclaims its name");
+    assert.equal(
+      resumed.details.sessionFile,
+      sessionFile,
+      "the prior session is replayed",
+    );
+    const resumedRun = (testApi.runningSubagents as Map<string, any>).get(
+      resumed.details.id,
+    );
+    assert.ok(resumedRun, "the resumed run is tracked");
+    assert.notEqual(resumedRun.paneId, firstPane, "a fresh pane hosts the run");
+
+    // The launch script replays the sandbox from the snapshot.
+    const script = readFileSync(resumed.details.launchScriptFile, "utf8");
+    assert.ok(
+      script.includes(sessionFile),
+      "the resumed launch script starts the prior session",
+    );
+    assert.ok(
+      script.includes("--no-extensions"),
+      "the replayed sandbox keeps the default-deny extension restriction",
+    );
+
+    // The message arrives as the child's next turn.
+    try {
+      await waitForFile(sessionFile, 120_000, /RESUME-OK/);
+      assert.ok(
+        readUserTurns(sessionFile).some((turn) =>
+          turn.includes("write the word BETA"),
+        ),
+        "the resume message is recorded as a user turn",
+      );
+    } finally {
+      resumedRun.abortController?.abort();
+      await waitForPaneGone(resumedRun.paneId).catch(() => {
+        /* cleanup must not mask an assertion failure */
+      });
+    }
+  });
+
+  it("refuses to resume when the sandbox snapshot is missing", async () => {
+    const mock = createMockPi();
+    (subagentsModule as any).default(mock.api);
+    const { sessionDir, ctx } = makeOrchestratorCtx(env, "legacy-parent");
+
+    // A registry entry whose session predates the sandbox snapshot.
+    const childSession = join(env.dir, `legacy-${uniqueId()}.jsonl`);
+    writeFileSync(
+      childSession,
+      `${JSON.stringify({ type: "session", id: "legacy-child" })}\n`,
+      "utf8",
+    );
+    registerName(join(sessionDir, "artifacts", "legacy-parent"), "Legacy", {
+      sessionFile: childSession,
+      sessionId: "legacy-child",
+    });
+
+    const messageTool = mock.tools.find(
+      (tool) => tool.name === "subagent_message",
+    );
+    const result = await messageTool.execute(
+      "legacy-resume",
+      { name: "Legacy", message: "hi" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(result.details.error, /Cannot safely resume "Legacy"/);
+    assert.match(result.details.error, /loadout|predates sandboxed resume/);
   });
 });

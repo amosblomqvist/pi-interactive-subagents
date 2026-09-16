@@ -1321,6 +1321,7 @@ export const __test__ = {
   contextWindowFor,
   formatUsageSegments,
   widgetIcon,
+  stopRefreshTimers,
 };
 
 function startWidgetRefresh() {
@@ -1330,6 +1331,20 @@ function startWidgetRefresh() {
     updateWidget();
   }, 1000);
   (globalThis as any)[WIDGET_INTERVAL_KEY] = widgetInterval;
+}
+
+/** Stop the widget/status refresh timers (test hook: keeps a test process alive otherwise). */
+function stopRefreshTimers(): void {
+  if (widgetInterval) {
+    clearInterval(widgetInterval);
+    widgetInterval = null;
+    (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
+  }
+  if (statusInterval) {
+    clearInterval(statusInterval);
+    statusInterval = null;
+    (globalThis as any)[STATUS_INTERVAL_KEY] = null;
+  }
 }
 
 /**

@@ -96,7 +96,7 @@ Availability requires `HERDR_ENV=1`, `HERDR_PANE_ID`, a reachable server, and a 
 
 ### D12 — Tests use Herdr's own oracles
 
-Integration tests create a scratch tab (or workspace) per run, assert focus with `pane list`'s `focused` flag, wait with `pane wait-output` instead of sleeps, gate prompts on state, and close panes unconditionally in cleanup. Surface tests skip when `HERDR_ENV` is absent. A headless server with a named session socket (`HERDR_SESSION`/`HERDR_SOCKET_PATH`, `server.headless_cols/rows`) makes a CI smoke job feasible without a client.
+Integration tests create a scratch tab (or workspace) per run, assert focus with `pane list`'s `focused` flag, wait with `pane wait-output` instead of sleeps, gate prompts on state, and close panes unconditionally in cleanup. Surface tests skip when `HERDR_ENV` is absent, so the suite also runs against a headless server started manually.
 
 ## Risks / Trade-offs
 
@@ -109,7 +109,7 @@ Integration tests create a scratch tab (or workspace) per run, assert focus with
 - [Server older than the client lacks a command] → Server version/protocol floor from `herdr status`, actionable upgrade message, and an error-code table pinned by tests.
 - [Layout crowding with many right splits] → Accepted non-parity; documented; optional future dimension-aware direction choice.
 - [Orchestrator dies between spawn and task delivery, stranding an idle subagent pane] → With tmux the task was baked into the launch command; under D2 it lives in orchestrator memory during the gate window. Accepted for this change; the mitigation (persisting the pending task into the run's artifact directory at spawn) is deferred — see Open Questions.
-- [macOS paths (zsh/bash, `SHELL`, `/tmp` removal) cannot be verified on the development machine] → Shell unit tests plus a required manual verification pass and a macOS/Windows CI smoke job.
+- [macOS paths (zsh/bash, `SHELL`, `/tmp` removal) cannot be verified on the development machine] → Shell unit tests plus a required manual verification pass on macOS zsh and bash.
 
 ## Migration Plan
 

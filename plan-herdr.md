@@ -21,9 +21,8 @@
 > - **Version floor (review item 6):** read the server's version and protocol from
 >   `herdr status`, not the client's `--version`.
 > - **Section 4 is out of scope:** pi already runs bash through Git Bash on Windows.
-> - **Tests and CI (sections 6 and 8):** focus is asserted from `pane list`'s `focused` flag;
->   a headless server on a named session socket makes the CI smoke job feasible now; this
->   machine cannot run the current suite until the harness is rewritten.
+> - **Tests (sections 6 and 8):** focus is asserted from `pane list`'s `focused` flag;
+>   this machine cannot run the current suite until the harness is rewritten.
 
 ## Scope and decisions
 
@@ -629,7 +628,6 @@ Remove:
    - hardcoded `bash`
    - POSIX-only `cd &&`
    - `#!/bin/bash`
-9. Add a macOS and Windows CI smoke-test job once Herdr can be reliably started in the CI environment. **Feasible now:** `herdr server` runs headless, named sessions get their own sockets (`HERDR_SESSION` / `HERDR_SOCKET_PATH`), and `server.headless_cols` / `server.headless_rows` size unattached panes, so panes can be created and inspected without a client.
 
 ## Acceptance criteria
 
