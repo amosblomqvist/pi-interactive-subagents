@@ -1,8 +1,15 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import {
+  mkdtempSync,
+  writeFileSync,
+  readFileSync,
+  mkdirSync,
+  rmSync,
+  existsSync,
+} from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
@@ -30,7 +37,36 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/tmux.ts";
+import {
+  generateLaunchScript,
+  parseSentinelExitCode,
+  quoteArg,
+  renderInvocation,
+  renderLaunchLine,
+  renderSentinelStatement,
+  resolveShellSpec,
+  SUBAGENT_DONE_PATTERN,
+  SUBAGENT_DONE_WAIT_REGEX,
+  writeLaunchScript,
+} from "../pi-extension/subagents/shell.ts";
+import {
+  __herdrTestHooks__,
+  assertPaneShellFamily,
+  checkHerdrAvailability,
+  closeHerdrPane,
+  compareVersions,
+  createHerdrPane,
+  getHerdrAgent,
+  HerdrError,
+  isTerminalHerdrError,
+  parseHerdrJson,
+  readHerdrPane,
+  runHerdr,
+  runHerdrWithBusyRetry,
+  shellFamilyFromProcessInfo,
+  waitHerdrOutput,
+  type HerdrRunner,
+} from "../pi-extension/subagents/herdr.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -56,7 +92,7 @@ import {
   runningChildrenCount,
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
-import { __pollForExitTest__ } from "../pi-extension/subagents/tmux.ts";
+import { __completionTest__ } from "../pi-extension/subagents/index.ts";
 
 // --- Helpers ---
 
@@ -142,7 +178,10 @@ function writeAgentFile(
   body = "You are a test agent.",
 ) {
   mkdirSync(agentsDir, { recursive: true });
-  writeFileSync(join(agentsDir, `${name}.md`), `---\n${frontmatter}\n---\n\n${body}\n`);
+  writeFileSync(
+    join(agentsDir, `${name}.md`),
+    `---\n${frontmatter}\n---\n\n${body}\n`,
+  );
 }
 
 async function withIsolatedAgentEnv(
@@ -233,7 +272,12 @@ describe("session.ts", () => {
 
   describe("getLeafId", () => {
     it("returns last entry id", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+      const file = createSessionFile(dir, [
+        SESSION_HEADER,
+        MODEL_CHANGE,
+        USER_MSG,
+        ASSISTANT_MSG,
+      ]);
       assert.equal(getLeafId(file), "asst-001");
     });
 
@@ -246,7 +290,12 @@ describe("session.ts", () => {
 
   describe("getNewEntries", () => {
     it("returns entries after a given line", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+      const file = createSessionFile(dir, [
+        SESSION_HEADER,
+        MODEL_CHANGE,
+        USER_MSG,
+        ASSISTANT_MSG,
+      ]);
       const entries = getNewEntries(file, 2);
       assert.equal(entries.length, 2);
       assert.equal(entries[0].id, "user-001");
@@ -260,23 +309,37 @@ describe("session.ts", () => {
     });
 
     it("countSessionEntryLines matches getNewEntries(0).length without parsing", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+      const file = createSessionFile(dir, [
+        SESSION_HEADER,
+        MODEL_CHANGE,
+        USER_MSG,
+        ASSISTANT_MSG,
+      ]);
       assert.equal(countSessionEntryLines(file), getNewEntries(file, 0).length);
       assert.equal(countSessionEntryLines(file), 4);
     });
 
     it("countSessionEntryLines ignores blank lines and returns 0 for missing files", () => {
       const file = join(dir, "blanks.jsonl");
-      writeFileSync(file, JSON.stringify({ type: "session", id: "x" }) + "\n\n\n");
+      writeFileSync(
+        file,
+        JSON.stringify({ type: "session", id: "x" }) + "\n\n\n",
+      );
       assert.equal(countSessionEntryLines(file), 1);
-      assert.equal(countSessionEntryLines(join(dir, "does-not-exist.jsonl")), 0);
+      assert.equal(
+        countSessionEntryLines(join(dir, "does-not-exist.jsonl")),
+        0,
+      );
     });
   });
 
   describe("getSessionId / resolveSessionFileById", () => {
     function writeSession(d: string, fname: string, id: string): string {
       const p = join(d, fname);
-      writeFileSync(p, JSON.stringify({ type: "session", id, version: 3 }) + "\n");
+      writeFileSync(
+        p,
+        JSON.stringify({ type: "session", id, version: 3 }) + "\n",
+      );
       return p;
     }
 
@@ -287,7 +350,11 @@ describe("session.ts", () => {
     });
 
     it("reads the header id from a session file", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG]);
+      const file = createSessionFile(dir, [
+        SESSION_HEADER,
+        MODEL_CHANGE,
+        USER_MSG,
+      ]);
       assert.equal(getSessionId(file), "sess-001");
     });
 
@@ -326,7 +393,8 @@ describe("session.ts", () => {
   describe("subagent loadout snapshot", () => {
     const sample: SubagentLoadout = {
       agent: "worker",
-      toolAllowlist: "read,write,edit,safe_bash,web_search,subagent,ask_question",
+      toolAllowlist:
+        "read,write,edit,safe_bash,web_search,subagent,ask_question",
       model: "openrouter/z-ai/glm-5.2",
       thinking: "medium",
       systemPromptMode: "append",
@@ -364,21 +432,39 @@ describe("session.ts", () => {
   describe("subagent name registry", () => {
     it("registers and resolves a name to its session file", () => {
       const adir = join(dir, "art-1");
-      registerName(adir, "worker", { sessionFile: "/s/worker.jsonl", sessionId: "id-worker" });
+      registerName(adir, "worker", {
+        sessionFile: "/s/worker.jsonl",
+        sessionId: "id-worker",
+      });
       const entry = resolveNameInRegistry(adir, "worker");
-      assert.deepEqual(entry, { sessionFile: "/s/worker.jsonl", sessionId: "id-worker" });
+      assert.deepEqual(entry, {
+        sessionFile: "/s/worker.jsonl",
+        sessionId: "id-worker",
+      });
       assert.ok(existsSync(nameRegistryPath(adir)));
     });
 
     it("accumulates multiple names and overwrites on re-register", () => {
       const adir = join(dir, "art-2");
-      registerName(adir, "scout", { sessionFile: "/s/scout.jsonl", sessionId: "id-scout" });
-      registerName(adir, "scout-2", { sessionFile: "/s/scout2.jsonl", sessionId: "id-scout2" });
+      registerName(adir, "scout", {
+        sessionFile: "/s/scout.jsonl",
+        sessionId: "id-scout",
+      });
+      registerName(adir, "scout-2", {
+        sessionFile: "/s/scout2.jsonl",
+        sessionId: "id-scout2",
+      });
       const reg = readNameRegistry(adir);
       assert.deepEqual(Object.keys(reg).sort(), ["scout", "scout-2"]);
       // Overwrite scout with a new session file.
-      registerName(adir, "scout", { sessionFile: "/s/scout-new.jsonl", sessionId: "id-scout-new" });
-      assert.equal(resolveNameInRegistry(adir, "scout")!.sessionFile, "/s/scout-new.jsonl");
+      registerName(adir, "scout", {
+        sessionFile: "/s/scout-new.jsonl",
+        sessionId: "id-scout-new",
+      });
+      assert.equal(
+        resolveNameInRegistry(adir, "scout")!.sessionFile,
+        "/s/scout-new.jsonl",
+      );
     });
 
     it("returns null for unknown names and {} for a missing/corrupt registry", () => {
@@ -478,7 +564,10 @@ describe("session.ts", () => {
           errorMessage: "stream interrupted",
         },
       };
-      assert.equal(findLastAssistantMessage([msg] as any[]), "Here is partial output.");
+      assert.equal(
+        findLastAssistantMessage([msg] as any[]),
+        "Here is partial output.",
+      );
     });
 
     it("does not invent a summary for a stop=error message with no errorMessage", () => {
@@ -496,8 +585,17 @@ describe("session.ts", () => {
 
   describe("appendBranchSummary", () => {
     it("appends valid branch_summary entry", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, USER_MSG, ASSISTANT_MSG]);
-      const id = appendBranchSummary(file, "user-001", "asst-001", "The plan was created.");
+      const file = createSessionFile(dir, [
+        SESSION_HEADER,
+        USER_MSG,
+        ASSISTANT_MSG,
+      ]);
+      const id = appendBranchSummary(
+        file,
+        "user-001",
+        "asst-001",
+        "The plan was created.",
+      );
 
       assert.ok(id, "should return an id");
       assert.equal(typeof id, "string");
@@ -540,14 +638,19 @@ describe("session.ts", () => {
 
   describe("seedSubagentSessionFile", () => {
     it("creates a lineage-only child session with parent linkage and no copied turns", () => {
-      const parentFile = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+      const parentFile = createSessionFile(dir, [
+        SESSION_HEADER,
+        MODEL_CHANGE,
+        USER_MSG,
+        ASSISTANT_MSG,
+      ]);
       const childFile = join(dir, "lineage-child.jsonl");
 
       seedSubagentSessionFile({
         mode: "lineage-only",
         parentSessionFile: parentFile,
         childSessionFile: childFile,
-        childCwd: "/tmp/child-cwd",
+        childCwd: join(tmpdir(), "child-cwd"),
       });
 
       const lines = readFileSync(childFile, "utf8").trim().split("\n");
@@ -556,11 +659,16 @@ describe("session.ts", () => {
       const header = JSON.parse(lines[0]);
       assert.equal(header.type, "session");
       assert.equal(header.parentSession, parentFile);
-      assert.equal(header.cwd, "/tmp/child-cwd");
+      assert.equal(header.cwd, join(tmpdir(), "child-cwd"));
     });
 
     it("creates a forked child session with copied context before the triggering user turn", () => {
-      const parentFile = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+      const parentFile = createSessionFile(dir, [
+        SESSION_HEADER,
+        MODEL_CHANGE,
+        USER_MSG,
+        ASSISTANT_MSG,
+      ]);
       const childFile = join(dir, "fork-child.jsonl");
 
       seedSubagentSessionFile({
@@ -579,8 +687,17 @@ describe("session.ts", () => {
       assert.equal(entries[0].parentSession, parentFile);
       assert.equal(entries[0].cwd, "/tmp/fork-child-cwd");
       assert.equal(entries[1].type, "model_change");
-      assert.equal(entries.some((entry) => entry.type === "session" && entry.parentSession !== parentFile), false);
-      assert.equal(entries.some((entry) => entry.type === "message"), false);
+      assert.equal(
+        entries.some(
+          (entry) =>
+            entry.type === "session" && entry.parentSession !== parentFile,
+        ),
+        false,
+      );
+      assert.equal(
+        entries.some((entry) => entry.type === "message"),
+        false,
+      );
     });
   });
 
@@ -591,11 +708,14 @@ describe("session.ts", () => {
       const targetFile = join(dir, "merge-target.jsonl");
       writeFileSync(
         sourceFile,
-        [SESSION_HEADER, USER_MSG, ASSISTANT_MSG].map((e) => JSON.stringify(e)).join("\n") + "\n",
+        [SESSION_HEADER, USER_MSG, ASSISTANT_MSG]
+          .map((e) => JSON.stringify(e))
+          .join("\n") + "\n",
       );
       writeFileSync(
         targetFile,
-        [SESSION_HEADER, USER_MSG].map((e) => JSON.stringify(e)).join("\n") + "\n",
+        [SESSION_HEADER, USER_MSG].map((e) => JSON.stringify(e)).join("\n") +
+          "\n",
       );
 
       // Merge entries after line 2 (the shared base)
@@ -610,11 +730,14 @@ describe("session.ts", () => {
   });
 
   describe("summarizeSessionStats", () => {
-    const asstWithUsage = (id: string, opts: {
-      model?: string;
-      tools?: string[];
-      usage?: Record<string, unknown>;
-    }) => ({
+    const asstWithUsage = (
+      id: string,
+      opts: {
+        model?: string;
+        tools?: string[];
+        usage?: Record<string, unknown>;
+      },
+    ) => ({
       type: "message",
       id,
       parentId: "user-001",
@@ -623,7 +746,11 @@ describe("session.ts", () => {
         ...(opts.model ? { model: opts.model } : {}),
         content: [
           { type: "text", text: "ok" },
-          ...(opts.tools ?? []).map((name, i) => ({ type: "toolCall", name, id: `${id}-tc${i}` })),
+          ...(opts.tools ?? []).map((name, i) => ({
+            type: "toolCall",
+            name,
+            id: `${id}-tc${i}`,
+          })),
         ],
         ...(opts.usage ? { usage: opts.usage } : {}),
       },
@@ -632,15 +759,34 @@ describe("session.ts", () => {
     it("aggregates tokens/cost cumulatively and tracks last context size", () => {
       const file = createSessionFile(dir, [
         SESSION_HEADER,
-        { type: "model_change", id: "mc-001", parentId: null, modelId: "claude-sonnet-4-6" },
+        {
+          type: "model_change",
+          id: "mc-001",
+          parentId: null,
+          modelId: "claude-sonnet-4-6",
+        },
         USER_MSG,
         asstWithUsage("a1", {
           tools: ["read", "grep"],
-          usage: { input: 100, output: 50, cacheRead: 1000, cacheWrite: 200, totalTokens: 1350, cost: { total: 0.01 } },
+          usage: {
+            input: 100,
+            output: 50,
+            cacheRead: 1000,
+            cacheWrite: 200,
+            totalTokens: 1350,
+            cost: { total: 0.01 },
+          },
         }),
         asstWithUsage("a2", {
           tools: ["write"],
-          usage: { input: 30, output: 70, cacheRead: 2000, cacheWrite: 0, totalTokens: 3500, cost: { total: 0.02 } },
+          usage: {
+            input: 30,
+            output: 70,
+            cacheRead: 2000,
+            cacheWrite: 0,
+            totalTokens: 3500,
+            cost: { total: 0.02 },
+          },
         }),
       ]);
       const stats = summarizeSessionStats(file)!;
@@ -658,14 +804,26 @@ describe("session.ts", () => {
     it("prefers per-message model over model_change", () => {
       const file = createSessionFile(dir, [
         SESSION_HEADER,
-        { type: "model_change", id: "mc-001", parentId: null, modelId: "claude-haiku-4-5" },
-        asstWithUsage("a1", { model: "claude-sonnet-4-6", usage: { totalTokens: 10, cost: { total: 0 } } }),
+        {
+          type: "model_change",
+          id: "mc-001",
+          parentId: null,
+          modelId: "claude-haiku-4-5",
+        },
+        asstWithUsage("a1", {
+          model: "claude-sonnet-4-6",
+          usage: { totalTokens: 10, cost: { total: 0 } },
+        }),
       ]);
       assert.equal(summarizeSessionStats(file)!.model, "claude-sonnet-4-6");
     });
 
     it("handles missing usage gracefully", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, USER_MSG, ASSISTANT_MSG]);
+      const file = createSessionFile(dir, [
+        SESSION_HEADER,
+        USER_MSG,
+        ASSISTANT_MSG,
+      ]);
       const stats = summarizeSessionStats(file)!;
       assert.equal(stats.toolCount, 0);
       assert.equal(stats.inputTokens, 0);
@@ -674,7 +832,10 @@ describe("session.ts", () => {
     });
 
     it("returns null for an unreadable file", () => {
-      assert.equal(summarizeSessionStats(join(dir, "does-not-exist.jsonl")), null);
+      assert.equal(
+        summarizeSessionStats(join(dir, "does-not-exist.jsonl")),
+        null,
+      );
     });
   });
 });
@@ -690,7 +851,9 @@ describe("status.ts", () => {
   });
 
   it("loads a valid config file", () => {
-    const examplePath = fileURLToPath(new URL("../config.json.example", import.meta.url));
+    const examplePath = fileURLToPath(
+      new URL("../config.json.example", import.meta.url),
+    );
     const config = loadStatusConfig(examplePath);
 
     assert.deepEqual(config, {
@@ -722,7 +885,10 @@ describe("status.ts", () => {
       /status\.enabled must be a boolean/,
     );
     assert.throws(
-      () => parseStatusConfig({ status: { enabled: true, defaultCadenceSeconds: 60 } }),
+      () =>
+        parseStatusConfig({
+          status: { enabled: true, defaultCadenceSeconds: 60 },
+        }),
       /status has unsupported key\(s\): defaultCadenceSeconds/,
     );
   });
@@ -730,7 +896,11 @@ describe("status.ts", () => {
   it("reports when neither local nor shared config exists", () => {
     withTempDir((dir) => {
       assert.throws(
-        () => loadStatusConfig(join(dir, "config.json"), join(dir, "config.json.example")),
+        () =>
+          loadStatusConfig(
+            join(dir, "config.json"),
+            join(dir, "config.json.example"),
+          ),
         /Missing subagent status config\. Expected .*config\.json.*or.*config\.json\.example/,
       );
     });
@@ -777,17 +947,21 @@ describe("status.ts", () => {
 
   it("classifies active snapshots without aging into stalled", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
-    state = observeStatus(state, {
-      snapshot: "present",
-      updatedAt: 5_000,
-      sequence: 1,
-      phase: "active",
-      active: true,
-      activeScope: "tool",
-      activeSince: 5_000,
-      activityLabel: "bash",
-      latestEvent: "tool_execution_start",
-    }, 5_000);
+    state = observeStatus(
+      state,
+      {
+        snapshot: "present",
+        updatedAt: 5_000,
+        sequence: 1,
+        phase: "active",
+        active: true,
+        activeScope: "tool",
+        activeSince: 5_000,
+        activityLabel: "bash",
+        latestEvent: "tool_execution_start",
+      },
+      5_000,
+    );
 
     const snapshot = classifyStatus(state, 240_000);
     assert.equal(snapshot.kind, "active");
@@ -797,26 +971,22 @@ describe("status.ts", () => {
 
   it("classifies waiting snapshots as healthy idle without becoming stalled", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
-    state = observeStatus(state, {
-      snapshot: "present",
-      updatedAt: 10_000,
-      sequence: 1,
-      phase: "waiting",
-      waitingSince: 10_000,
-      latestEvent: "agent_end",
-    }, 10_000);
+    state = observeStatus(
+      state,
+      {
+        snapshot: "present",
+        updatedAt: 10_000,
+        sequence: 1,
+        phase: "waiting",
+        waitingSince: 10_000,
+        latestEvent: "agent_end",
+      },
+      10_000,
+    );
 
     const snapshot = classifyStatus(state, 240_000);
     assert.equal(snapshot.kind, "waiting");
     assert.equal(snapshot.waitingDurationText, "3m");
-  });
-
-  it("uses elapsed-only fallback for claude-backed subagents", () => {
-    const state = createStatusState({ source: "claude", startTimeMs: 0 });
-    const snapshot = classifyStatus(state, 125_000);
-
-    assert.equal(snapshot.kind, "running");
-    assert.equal(snapshot.elapsedText, "2m");
   });
 
   it("detects stalled transitions and recovery", () => {
@@ -827,14 +997,18 @@ describe("status.ts", () => {
     assert.equal(advanced.transition, "stalled");
     assert.equal(advanced.snapshot.kind, "stalled");
 
-    state = observeStatus(advanced.nextState, {
-      snapshot: "present",
-      updatedAt: 96_000,
-      sequence: 1,
-      phase: "waiting",
-      waitingSince: 96_000,
-      latestEvent: "agent_end",
-    }, 96_000);
+    state = observeStatus(
+      advanced.nextState,
+      {
+        snapshot: "present",
+        updatedAt: 96_000,
+        sequence: 1,
+        phase: "waiting",
+        waitingSince: 96_000,
+        latestEvent: "agent_end",
+      },
+      96_000,
+    );
     advanced = advanceStatusState(state, 97_000);
     assert.equal(advanced.transition, "recovered");
     assert.equal(advanced.snapshot.kind, "waiting");
@@ -842,15 +1016,19 @@ describe("status.ts", () => {
 
   it("keeps the last healthy kind during transient snapshot loss", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
-    state = observeStatus(state, {
-      snapshot: "present",
-      updatedAt: 5_000,
-      sequence: 1,
-      phase: "active",
-      active: true,
-      activeScope: "streaming",
-      activeSince: 5_000,
-    }, 5_000);
+    state = observeStatus(
+      state,
+      {
+        snapshot: "present",
+        updatedAt: 5_000,
+        sequence: 1,
+        phase: "active",
+        active: true,
+        activeScope: "streaming",
+        activeSince: 5_000,
+      },
+      5_000,
+    );
     state = advanceStatusState(state, 6_000).nextState;
     state = observeStatus(state, { snapshot: "missing" }, 10_000);
 
@@ -862,16 +1040,20 @@ describe("status.ts", () => {
   it("forces an active state to waiting after interrupt", () => {
     const now = 20_000;
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
-    state = observeStatus(state, {
-      snapshot: "present",
-      updatedAt: 5_000,
-      sequence: 1,
-      phase: "active",
-      active: true,
-      activeScope: "tool",
-      activeSince: 5_000,
-      activityLabel: "bash",
-    }, 5_000);
+    state = observeStatus(
+      state,
+      {
+        snapshot: "present",
+        updatedAt: 5_000,
+        sequence: 1,
+        phase: "active",
+        active: true,
+        activeScope: "tool",
+        activeSince: 5_000,
+        activityLabel: "bash",
+      },
+      5_000,
+    );
 
     assert.equal(classifyStatus(state, now).kind, "active");
 
@@ -886,25 +1068,33 @@ describe("status.ts", () => {
 
   it("orders same-millisecond snapshots by sequence", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
-    state = observeStatus(state, {
-      snapshot: "present",
-      updatedAt: 10_000,
-      sequence: 2,
-      phase: "active",
-      active: true,
-      activeScope: "tool",
-      activeSince: 10_000,
-      activityLabel: "bash",
-    }, 10_000);
+    state = observeStatus(
+      state,
+      {
+        snapshot: "present",
+        updatedAt: 10_000,
+        sequence: 2,
+        phase: "active",
+        active: true,
+        activeScope: "tool",
+        activeSince: 10_000,
+        activityLabel: "bash",
+      },
+      10_000,
+    );
 
-    state = observeStatus(state, {
-      snapshot: "present",
-      updatedAt: 10_000,
-      sequence: 3,
-      phase: "waiting",
-      waitingSince: 10_000,
-      latestEvent: "agent_end",
-    }, 10_001);
+    state = observeStatus(
+      state,
+      {
+        snapshot: "present",
+        updatedAt: 10_000,
+        sequence: 3,
+        phase: "waiting",
+        waitingSince: 10_000,
+        latestEvent: "agent_end",
+      },
+      10_001,
+    );
 
     const snapshot = classifyStatus(state, 11_000);
     assert.equal(snapshot.kind, "waiting");
@@ -913,29 +1103,37 @@ describe("status.ts", () => {
 
   it("recovers from a transient snapshot read failure with the same valid snapshot", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
-    state = observeStatus(state, {
-      snapshot: "present",
-      updatedAt: 5_000,
-      sequence: 2,
-      phase: "active",
-      active: true,
-      activeScope: "tool",
-      activeSince: 5_000,
-      activityLabel: "bash",
-    }, 5_000);
+    state = observeStatus(
+      state,
+      {
+        snapshot: "present",
+        updatedAt: 5_000,
+        sequence: 2,
+        phase: "active",
+        active: true,
+        activeScope: "tool",
+        activeSince: 5_000,
+        activityLabel: "bash",
+      },
+      5_000,
+    );
     state = observeStatus(state, { snapshot: "missing" }, 10_000);
     assert.equal(classifyStatus(state, 10_000).statusLabel, null);
 
-    state = observeStatus(state, {
-      snapshot: "present",
-      updatedAt: 5_000,
-      sequence: 2,
-      phase: "active",
-      active: true,
-      activeScope: "tool",
-      activeSince: 5_000,
-      activityLabel: "bash",
-    }, 11_000);
+    state = observeStatus(
+      state,
+      {
+        snapshot: "present",
+        updatedAt: 5_000,
+        sequence: 2,
+        phase: "active",
+        active: true,
+        activeScope: "tool",
+        activeSince: 5_000,
+        activityLabel: "bash",
+      },
+      11_000,
+    );
 
     const snapshot = classifyStatus(state, 11_000);
     assert.equal(snapshot.kind, "active");
@@ -944,56 +1142,72 @@ describe("status.ts", () => {
 
   it("ignores stale and exact old snapshots after interrupt and accepts newer snapshots", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
-    state = observeStatus(state, {
-      snapshot: "present",
-      updatedAt: 5_000,
-      sequence: 1,
-      phase: "active",
-      active: true,
-      activeScope: "tool",
-      activeSince: 5_000,
-      activityLabel: "bash",
-    }, 5_000);
+    state = observeStatus(
+      state,
+      {
+        snapshot: "present",
+        updatedAt: 5_000,
+        sequence: 1,
+        phase: "active",
+        active: true,
+        activeScope: "tool",
+        activeSince: 5_000,
+        activityLabel: "bash",
+      },
+      5_000,
+    );
     state = forceStatusAfterInterrupt(state, 20_000);
 
-    const stale = observeStatus(state, {
-      snapshot: "present",
-      updatedAt: 5_000,
-      sequence: 1,
-      phase: "active",
-      active: true,
-      activeScope: "tool",
-      activeSince: 5_000,
-      activityLabel: "bash",
-    }, 21_000);
+    const stale = observeStatus(
+      state,
+      {
+        snapshot: "present",
+        updatedAt: 5_000,
+        sequence: 1,
+        phase: "active",
+        active: true,
+        activeScope: "tool",
+        activeSince: 5_000,
+        activityLabel: "bash",
+      },
+      21_000,
+    );
     let snapshot = classifyStatus(stale, 21_000);
     assert.equal(snapshot.kind, "waiting");
     assert.equal(snapshot.activityLabel, "interrupted");
 
-    const sameTimestamp = observeStatus(stale, {
-      snapshot: "present",
-      updatedAt: 20_000,
-      sequence: 1,
-      phase: "active",
-      active: true,
-      activeScope: "tool",
-      activeSince: 20_000,
-      activityLabel: "bash",
-    }, 22_000);
+    const sameTimestamp = observeStatus(
+      stale,
+      {
+        snapshot: "present",
+        updatedAt: 20_000,
+        sequence: 1,
+        phase: "active",
+        active: true,
+        activeScope: "tool",
+        activeSince: 20_000,
+        activityLabel: "bash",
+      },
+      22_000,
+    );
     snapshot = classifyStatus(sameTimestamp, 22_000);
     assert.equal(snapshot.kind, "waiting");
     assert.equal(snapshot.activityLabel, "interrupted");
 
-    const resumed = observeStatus(sameTimestamp, {
-      snapshot: "present",
-      sequence: 2,
-      updatedAt: 25_000,
-      phase: "active",
-      active: true,
-      activeScope: "streaming",
-      activeSince: 25_000,
-      activityLabel: "streaming",
-    }, 25_000);
+    const resumed = observeStatus(
+      sameTimestamp,
+      {
+        snapshot: "present",
+        sequence: 2,
+        updatedAt: 25_000,
+        phase: "active",
+        active: true,
+        activeScope: "streaming",
+        activeSince: 25_000,
+        activityLabel: "streaming",
+      },
+      25_000,
+    );
     snapshot = classifyStatus(resumed, 25_000);
     assert.equal(snapshot.kind, "active");
     assert.equal(resumed.activeScope, "streaming");
@@ -1020,19 +1234,38 @@ describe("status.ts", () => {
       },
       299_000,
     );
-    const line = formatStatusLine(longName, classifyStatus(stalledState, 240_000));
-    const recovered = formatTransitionLine(longName, classifyStatus(activeState, 300_000), "recovered");
+    const line = formatStatusLine(
+      longName,
+      classifyStatus(stalledState, 240_000),
+    );
+    const recovered = formatTransitionLine(
+      longName,
+      classifyStatus(activeState, 300_000),
+      "recovered",
+    );
 
     assert.doesNotMatch(line, /\n/);
     assert.doesNotMatch(recovered, /\n/);
-    assert.ok(line.length <= 120, `expected bounded line length, got ${line.length}`);
-    assert.ok(recovered.length <= 120, `expected bounded line length, got ${recovered.length}`);
+    assert.ok(
+      line.length <= 120,
+      `expected bounded line length, got ${line.length}`,
+    );
+    assert.ok(
+      recovered.length <= 120,
+      `expected bounded line length, got ${recovered.length}`,
+    );
   });
 
   it("caps visible status lines and reports overflow consistently", () => {
     const waitingState = observeStatus(
       createStatusState({ source: "pi", startTimeMs: 0 }),
-      { snapshot: "present", updatedAt: 180_000, sequence: 1, phase: "waiting", waitingSince: 180_000 },
+      {
+        snapshot: "present",
+        updatedAt: 180_000,
+        sequence: 1,
+        phase: "waiting",
+        waitingSince: 180_000,
+      },
       180_000,
     );
     const activeState = observeStatus(
@@ -1049,15 +1282,35 @@ describe("status.ts", () => {
       },
       419_000,
     );
-    const waitingLine = formatStatusLine("Worker", classifyStatus(waitingState, 300_000));
-    const recoveredLine = formatTransitionLine("Worker", classifyStatus(activeState, 420_000), "recovered");
-    const lines = [waitingLine, recoveredLine, "Scout running 2m.", "Reviewer running 4m.", "Planner running 6m."];
+    const waitingLine = formatStatusLine(
+      "Worker",
+      classifyStatus(waitingState, 300_000),
+    );
+    const recoveredLine = formatTransitionLine(
+      "Worker",
+      classifyStatus(activeState, 420_000),
+      "recovered",
+    );
+    const lines = [
+      waitingLine,
+      recoveredLine,
+      "Scout running 2m.",
+      "Reviewer running 4m.",
+      "Planner running 6m.",
+    ];
     const capped = capStatusLines(lines, 3);
     const aggregate = formatStatusAggregate(lines, 3);
 
     assert.equal(waitingLine, "Worker running 5m, waiting 2m.");
-    assert.equal(recoveredLine, "Worker running 7m, recovered; active (bash 1s).");
-    assert.deepEqual(capped.visibleLines, [waitingLine, recoveredLine, "Scout running 2m."]);
+    assert.equal(
+      recoveredLine,
+      "Worker running 7m, recovered; active (bash 1s).",
+    );
+    assert.deepEqual(capped.visibleLines, [
+      waitingLine,
+      recoveredLine,
+      "Scout running 2m.",
+    ]);
     assert.equal(capped.overflow, 2);
     assert.match(aggregate, /^Subagent status:/);
     assert.match(aggregate, /\+2 more running\./);
@@ -1107,10 +1360,14 @@ describe("subagent discovery", () => {
         ].join("\n"),
       );
 
-      const loadedTrue = testApi.loadAgentDefaults("interactive-true-test-agent");
+      const loadedTrue = testApi.loadAgentDefaults(
+        "interactive-true-test-agent",
+      );
       assert.equal(loadedTrue?.interactive, true);
 
-      const loadedFalse = testApi.loadAgentDefaults("interactive-false-test-agent");
+      const loadedFalse = testApi.loadAgentDefaults(
+        "interactive-false-test-agent",
+      );
       assert.equal(loadedFalse?.interactive, false);
     });
   });
@@ -1134,12 +1391,18 @@ describe("subagent discovery", () => {
   it("resolveEffectiveInteractive defaults to the inverse of auto-exit", () => {
     // Autonomous agents (auto-exit: true) are NOT interactive — parent gets stall pings.
     assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { autoExit: true }),
+      testApi.resolveEffectiveInteractive(
+        { name: "A", task: "T" },
+        { autoExit: true },
+      ),
       false,
     );
     // Agents without auto-exit ARE interactive — parent does not receive status transition pings.
     assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { autoExit: false }),
+      testApi.resolveEffectiveInteractive(
+        { name: "A", task: "T" },
+        { autoExit: false },
+      ),
       true,
     );
     assert.equal(
@@ -1189,11 +1452,16 @@ describe("subagent discovery", () => {
     assert.ok(worker, "expected bundled worker to be discoverable");
     assert.deepEqual(worker.subagentAgents, ["scout", "researcher"]);
 
-    const allowlist = testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: true });
+    const allowlist = testApi.buildSubagentToolAllowlist(worker.tools, {
+      grantSpawning: true,
+    });
     assert.ok(allowlist, "expected an allowlist");
     const tools = new Set(allowlist!.split(","));
     for (const t of ["subagent", "subagent_message", "subagents_list"]) {
-      assert.ok(tools.has(t), `expected spawning tool ${t} in worker allowlist`);
+      assert.ok(
+        tools.has(t),
+        `expected spawning tool ${t} in worker allowlist`,
+      );
     }
     assert.ok(tools.has("bash"), "expected worker to keep bash");
   });
@@ -1202,15 +1470,32 @@ describe("subagent discovery", () => {
     for (const name of ["scout", "researcher"]) {
       const defs = testApi.loadAgentDefaults(name);
       assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
-      assert.equal(defs.subagentAgents, undefined, `${name} should not declare subagent_agents`);
+      assert.equal(
+        defs.subagentAgents,
+        undefined,
+        `${name} should not declare subagent_agents`,
+      );
     }
   });
 
   it("getToolExtensionPath maps custom tools and skips built-ins", () => {
     assert.equal(testApi.getToolExtensionPath("read"), undefined);
     assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
-    assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
+    // The web tools come from a pi package (pi-web-access) on modern installs;
+    // the legacy agent-config `extensions/web-search` layout is only mapped
+    // when it exists on disk, so assert the shape where the install has it.
+    const agentDir =
+      process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+    if (existsSync(join(agentDir, "extensions", "web-search", "index.ts"))) {
+      assert.ok(
+        testApi
+          .getToolExtensionPath("web_search")
+          ?.endsWith("web-search/index.ts"),
+      );
+    }
+    assert.ok(
+      testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"),
+    );
     // Spawning tools are registered by this extension itself.
     assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
   });
@@ -1234,26 +1519,41 @@ describe("subagent discovery", () => {
   });
 
   it("resolves session mode from frontmatter (standalone default)", () => {
-    assert.equal(testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, null), "standalone");
     assert.equal(
-      testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, { sessionMode: "lineage-only" }),
+      testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, null),
+      "standalone",
+    );
+    assert.equal(
+      testApi.resolveEffectiveSessionMode(
+        { name: "A", task: "T" },
+        { sessionMode: "lineage-only" },
+      ),
       "lineage-only",
     );
     assert.equal(
-      testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, { sessionMode: "fork" }),
+      testApi.resolveEffectiveSessionMode(
+        { name: "A", task: "T" },
+        { sessionMode: "fork" },
+      ),
       "fork",
     );
   });
 
   it("resolves launch behavior for standalone, lineage-only, and fork modes", () => {
-    assert.deepEqual(testApi.resolveLaunchBehavior({ name: "A", task: "T" }, null), {
-      sessionMode: "standalone",
-      seededSessionMode: null,
-      inheritsConversationContext: false,
-      taskDelivery: "artifact",
-    });
     assert.deepEqual(
-      testApi.resolveLaunchBehavior({ name: "A", task: "T" }, { sessionMode: "lineage-only" }),
+      testApi.resolveLaunchBehavior({ name: "A", task: "T" }, null),
+      {
+        sessionMode: "standalone",
+        seededSessionMode: null,
+        inheritsConversationContext: false,
+        taskDelivery: "artifact",
+      },
+    );
+    assert.deepEqual(
+      testApi.resolveLaunchBehavior(
+        { name: "A", task: "T" },
+        { sessionMode: "lineage-only" },
+      ),
       {
         sessionMode: "lineage-only",
         seededSessionMode: "lineage-only",
@@ -1262,7 +1562,10 @@ describe("subagent discovery", () => {
       },
     );
     assert.deepEqual(
-      testApi.resolveLaunchBehavior({ name: "A", task: "T" }, { sessionMode: "fork" }),
+      testApi.resolveLaunchBehavior(
+        { name: "A", task: "T" },
+        { sessionMode: "fork" },
+      ),
       {
         sessionMode: "fork",
         seededSessionMode: "fork",
@@ -1301,14 +1604,20 @@ describe("subagent discovery", () => {
           cwd: null,
           agentDir: null,
         },
-        { artifactDir: d, name: "worker" },
+        { artifactDir: d, name: "worker", shellKind: "posix" },
       );
       const joined = parts.join(" ");
       // Model with thinking suffix.
       assert.ok(joined.includes("--model"), "expected --model");
-      assert.ok(joined.includes("openrouter/z-ai/glm-5.2:medium"), "expected model:thinking");
+      assert.ok(
+        joined.includes("openrouter/z-ai/glm-5.2:medium"),
+        "expected model:thinking",
+      );
       // Identity written to a file and appended.
-      assert.ok(joined.includes("--append-system-prompt"), "expected --append-system-prompt");
+      assert.ok(
+        joined.includes("--append-system-prompt"),
+        "expected --append-system-prompt",
+      );
       // Default-deny restriction.
       assert.ok(parts.includes("--no-extensions"), "expected --no-extensions");
       const toolsIdx = parts.indexOf("--tools");
@@ -1338,7 +1647,7 @@ describe("subagent discovery", () => {
           cwd: null,
           agentDir: null,
         },
-        { artifactDir: d, name: "fork" },
+        { artifactDir: d, name: "fork", shellKind: "posix" },
       );
       assert.deepEqual(parts, []);
     });
@@ -1346,21 +1655,33 @@ describe("subagent discovery", () => {
 
   it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {
     assert.deepEqual(
-      testApi.buildPiPromptArgs({ effectiveSkills: "review,lint", taskDelivery: "artifact", taskArg: "@artifact.md" }),
+      testApi.buildPiPromptArgs({
+        effectiveSkills: "review,lint",
+        taskDelivery: "artifact",
+        taskArg: "@artifact.md",
+      }),
       ["", "/skill:review", "/skill:lint", "@artifact.md"],
     );
   });
 
   it("buildPiPromptArgs omits separator for artifact-backed launches without skills", () => {
     assert.deepEqual(
-      testApi.buildPiPromptArgs({ effectiveSkills: undefined, taskDelivery: "artifact", taskArg: "@artifact.md" }),
+      testApi.buildPiPromptArgs({
+        effectiveSkills: undefined,
+        taskDelivery: "artifact",
+        taskArg: "@artifact.md",
+      }),
       ["@artifact.md"],
     );
   });
 
   it("buildPiPromptArgs omits separator for direct launches with skills", () => {
     assert.deepEqual(
-      testApi.buildPiPromptArgs({ effectiveSkills: "review", taskDelivery: "direct", taskArg: "do the task" }),
+      testApi.buildPiPromptArgs({
+        effectiveSkills: "review",
+        taskDelivery: "direct",
+        taskArg: "do the task",
+      }),
       ["/skill:review", "do the task"],
     );
   });
@@ -1380,13 +1701,19 @@ describe("subagent discovery", () => {
       const { api, registeredTools } = createMockExtensionApi();
       (subagentsModule as any).default(api);
 
-      const tool = registeredTools.find((tool) => tool.name === "subagents_list");
+      const tool = registeredTools.find(
+        (tool) => tool.name === "subagents_list",
+      );
       assert.ok(tool, "expected subagents_list to be registered");
 
       const result = await tool.execute();
       const agents = result.details?.agents ?? [];
 
-      assert.ok(agents.some((agent: any) => agent.name === "visible-discovery-test-agent"));
+      assert.ok(
+        agents.some(
+          (agent: any) => agent.name === "visible-discovery-test-agent",
+        ),
+      );
       assert.match(result.content[0].text, /visible-discovery-test-agent/);
     });
   });
@@ -1408,14 +1735,24 @@ describe("subagent discovery", () => {
       const { api, registeredTools } = createMockExtensionApi();
       (subagentsModule as any).default(api);
 
-      const tool = registeredTools.find((tool) => tool.name === "subagents_list");
+      const tool = registeredTools.find(
+        (tool) => tool.name === "subagents_list",
+      );
       assert.ok(tool, "expected subagents_list to be registered");
 
       const result = await tool.execute();
       const agents = result.details?.agents ?? [];
 
-      assert.equal(agents.some((agent: any) => agent.name === "hidden-discovery-test-agent"), false);
-      assert.doesNotMatch(result.content[0].text, /hidden-discovery-test-agent/);
+      assert.equal(
+        agents.some(
+          (agent: any) => agent.name === "hidden-discovery-test-agent",
+        ),
+        false,
+      );
+      assert.doesNotMatch(
+        result.content[0].text,
+        /hidden-discovery-test-agent/,
+      );
 
       const loaded = testApi.loadAgentDefaults("hidden-discovery-test-agent");
       assert.ok(loaded, "expected hidden agent to remain directly loadable");
@@ -1426,47 +1763,64 @@ describe("subagent discovery", () => {
   });
 
   it("lets a hidden project agent shadow a visible global agent", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir, globalAgentsDir }) => {
-      writeAgentFile(
-        globalAgentsDir,
-        "shadowed-discovery-test-agent",
-        [
-          "name: shadowed-discovery-test-agent",
-          "description: Global visible agent",
-          "model: anthropic/test-global",
-        ].join("\n"),
-        "You are the global visible agent.",
-      );
-      writeAgentFile(
-        projectAgentsDir,
-        "shadowed-discovery-test-agent",
-        [
-          "name: shadowed-discovery-test-agent",
-          "description: Project hidden agent",
-          "model: anthropic/test-project",
-          "disable-model-invocation: true",
-        ].join("\n"),
-        "You are the project hidden agent.",
-      );
+    await withIsolatedAgentEnv(
+      async ({ projectAgentsDir, globalAgentsDir }) => {
+        writeAgentFile(
+          globalAgentsDir,
+          "shadowed-discovery-test-agent",
+          [
+            "name: shadowed-discovery-test-agent",
+            "description: Global visible agent",
+            "model: anthropic/test-global",
+          ].join("\n"),
+          "You are the global visible agent.",
+        );
+        writeAgentFile(
+          projectAgentsDir,
+          "shadowed-discovery-test-agent",
+          [
+            "name: shadowed-discovery-test-agent",
+            "description: Project hidden agent",
+            "model: anthropic/test-project",
+            "disable-model-invocation: true",
+          ].join("\n"),
+          "You are the project hidden agent.",
+        );
 
-      const { api, registeredTools } = createMockExtensionApi();
-      (subagentsModule as any).default(api);
+        const { api, registeredTools } = createMockExtensionApi();
+        (subagentsModule as any).default(api);
 
-      const tool = registeredTools.find((tool) => tool.name === "subagents_list");
-      assert.ok(tool, "expected subagents_list to be registered");
+        const tool = registeredTools.find(
+          (tool) => tool.name === "subagents_list",
+        );
+        assert.ok(tool, "expected subagents_list to be registered");
 
-      const result = await tool.execute();
-      const agents = result.details?.agents ?? [];
+        const result = await tool.execute();
+        const agents = result.details?.agents ?? [];
 
-      assert.equal(agents.some((agent: any) => agent.name === "shadowed-discovery-test-agent"), false);
-      assert.doesNotMatch(result.content[0].text, /shadowed-discovery-test-agent/);
+        assert.equal(
+          agents.some(
+            (agent: any) => agent.name === "shadowed-discovery-test-agent",
+          ),
+          false,
+        );
+        assert.doesNotMatch(
+          result.content[0].text,
+          /shadowed-discovery-test-agent/,
+        );
 
-      const loaded = testApi.loadAgentDefaults("shadowed-discovery-test-agent");
-      assert.ok(loaded, "expected project override to remain directly loadable");
-      assert.equal(loaded.model, "anthropic/test-project");
-      assert.equal(loaded.body, "You are the project hidden agent.");
-      assert.equal(loaded.disableModelInvocation, true);
-    });
+        const loaded = testApi.loadAgentDefaults(
+          "shadowed-discovery-test-agent",
+        );
+        assert.ok(
+          loaded,
+          "expected project override to remain directly loadable",
+        );
+        assert.equal(loaded.model, "anthropic/test-project");
+        assert.equal(loaded.body, "You are the project hidden agent.");
+        assert.equal(loaded.disableModelInvocation, true);
+      },
+    );
   });
 });
 describe("subagent-done.ts", () => {
@@ -1500,7 +1854,13 @@ describe("subagent-done.ts", () => {
       // Auto-exit subagents must shut down on retry-exhaustion errors so the
       // parent is woken. The error sidecar (written separately) carries the
       // failure detail; staying open would just strand the worker.
-      const messages = [{ role: "assistant", stopReason: "error", errorMessage: "529 overloaded" }];
+      const messages = [
+        {
+          role: "assistant",
+          stopReason: "error",
+          errorMessage: "529 overloaded",
+        },
+      ];
       assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
     });
   });
@@ -1508,9 +1868,17 @@ describe("subagent-done.ts", () => {
   describe("findLatestAssistantError", () => {
     it("returns the error info from a stopReason=error message", () => {
       const messages = [
-        { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "ok" }] },
+        {
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: "ok" }],
+        },
         { role: "toolResult", content: [] },
-        { role: "assistant", stopReason: "error", errorMessage: "Anthropic 529 Overloaded" },
+        {
+          role: "assistant",
+          stopReason: "error",
+          errorMessage: "Anthropic 529 Overloaded",
+        },
       ];
       assert.deepEqual(findLatestAssistantError(messages), {
         errorMessage: "Anthropic 529 Overloaded",
@@ -1522,7 +1890,11 @@ describe("subagent-done.ts", () => {
       const messages = [
         { role: "assistant", stopReason: "error", errorMessage: "old failure" },
         { role: "user", content: [] },
-        { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] },
+        {
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: "done" }],
+        },
       ];
       assert.equal(findLatestAssistantError(messages), null);
     });
@@ -1565,16 +1937,33 @@ describe("subagent-done.ts", () => {
     });
 
     it("reflects the live child count published by index.ts", () => {
-      withGlobal(() => 3, () => {
-        assert.equal(runningChildrenCount(), 3);
-      });
+      withGlobal(
+        () => 3,
+        () => {
+          assert.equal(runningChildrenCount(), 3);
+        },
+      );
     });
 
     it("treats zero/negative/non-number/throwing getters as 0", () => {
-      withGlobal(() => 0, () => assert.equal(runningChildrenCount(), 0));
-      withGlobal(() => -1, () => assert.equal(runningChildrenCount(), 0));
-      withGlobal(() => "two", () => assert.equal(runningChildrenCount(), 0));
-      withGlobal(() => { throw new Error("boom"); }, () => assert.equal(runningChildrenCount(), 0));
+      withGlobal(
+        () => 0,
+        () => assert.equal(runningChildrenCount(), 0),
+      );
+      withGlobal(
+        () => -1,
+        () => assert.equal(runningChildrenCount(), 0),
+      );
+      withGlobal(
+        () => "two",
+        () => assert.equal(runningChildrenCount(), 0),
+      );
+      withGlobal(
+        () => {
+          throw new Error("boom");
+        },
+        () => assert.equal(runningChildrenCount(), 0),
+      );
     });
   });
 
@@ -1608,7 +1997,9 @@ describe("subagent-done.ts", () => {
         const names = mock.registeredTools.map((t) => t.name);
         assert.ok(names.includes("ask_question"));
         assert.ok(!names.includes("caller_ping"));
-        const tool = mock.registeredTools.find((t) => t.name === "ask_question");
+        const tool = mock.registeredTools.find(
+          (t) => t.name === "ask_question",
+        );
         assert.deepEqual(Object.keys(tool.parameters.properties), ["question"]);
         assert.match(tool.description, /orchestrator/i);
       } finally {
@@ -1622,12 +2013,28 @@ describe("subagent-done.ts", () => {
       const sessionFile = join(dir, "s.jsonl");
       const { mock, restore } = setupSubagentExtension(sessionFile);
       try {
-        const tool = mock.registeredTools.find((t) => t.name === "ask_question");
+        const tool = mock.registeredTools.find(
+          (t) => t.name === "ask_question",
+        );
         let shutdownCalled = false;
-        const ctx = { shutdown() { shutdownCalled = true; } } as any;
-        const out = await tool.execute("call-1", { question: "Which API base URL?" }, undefined, undefined, ctx);
+        const ctx = {
+          shutdown() {
+            shutdownCalled = true;
+          },
+        } as any;
+        const out = await tool.execute(
+          "call-1",
+          { question: "Which API base URL?" },
+          undefined,
+          undefined,
+          ctx,
+        );
 
-        assert.equal(shutdownCalled, false, "ask_question must keep the session open");
+        assert.equal(
+          shutdownCalled,
+          false,
+          "ask_question must keep the session open",
+        );
         assert.match(out.content[0].text, /wait/i);
 
         const askFile = `${sessionFile}.ask`;
@@ -1655,9 +2062,17 @@ describe("subagent-done.ts", () => {
           if (!handlers.has(event)) handlers.set(event, []);
           handlers.get(event)!.push(handler);
         },
-        registerTool(t: any) { tools.push(t); },
-        registerCommand() {}, registerMessageRenderer() {}, registerShortcut() {},
-        sendUserMessage() {}, sendMessage() {}, getAllTools() { return []; },
+        registerTool(t: any) {
+          tools.push(t);
+        },
+        registerCommand() {},
+        registerMessageRenderer() {},
+        registerShortcut() {},
+        sendUserMessage() {},
+        sendMessage() {},
+        getAllTools() {
+          return [];
+        },
       } as any;
       const saved = {
         session: process.env.PI_SUBAGENT_SESSION,
@@ -1680,22 +2095,42 @@ describe("subagent-done.ts", () => {
       };
       const ask = async () => {
         const tool = tools.find((t) => t.name === "ask_question");
-        await tool.execute("c1", { question: "v1 or v2?" }, undefined, undefined, { shutdown() {} });
+        await tool.execute(
+          "c1",
+          { question: "v1 or v2?" },
+          undefined,
+          undefined,
+          { shutdown() {} },
+        );
       };
       return { emit, ask, restore };
     }
 
     it("exits (does not park) when the reply arrives mid-run via input", async () => {
       const dir = createTestDir();
-      const { emit, ask, restore } = setupCapturingExtension(join(dir, "s.jsonl"));
+      const { emit, ask, restore } = setupCapturingExtension(
+        join(dir, "s.jsonl"),
+      );
       try {
         emit("agent_start");
         await ask(); // sets awaitingAnswer mid-run
         // Reply arrives MID-RUN as a steer: input fires, no new agent_start.
         emit("input");
         let shutdown = false;
-        emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
-        assert.equal(shutdown, true, "reply consumed mid-run → agent_end should exit, not park");
+        emit(
+          "agent_end",
+          { messages: [] },
+          {
+            shutdown() {
+              shutdown = true;
+            },
+          },
+        );
+        assert.equal(
+          shutdown,
+          true,
+          "reply consumed mid-run → agent_end should exit, not park",
+        );
       } finally {
         restore();
         rmSync(dir, { recursive: true, force: true });
@@ -1704,14 +2139,28 @@ describe("subagent-done.ts", () => {
 
     it("parks as waiting at agent_end while the reply is still pending (no input yet)", async () => {
       const dir = createTestDir();
-      const { emit, ask, restore } = setupCapturingExtension(join(dir, "s.jsonl"));
+      const { emit, ask, restore } = setupCapturingExtension(
+        join(dir, "s.jsonl"),
+      );
       try {
         emit("agent_start");
         await ask();
         // No input yet — the orchestrator has not replied.
         let shutdown = false;
-        emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
-        assert.equal(shutdown, false, "pending question with no reply must park, not exit");
+        emit(
+          "agent_end",
+          { messages: [] },
+          {
+            shutdown() {
+              shutdown = true;
+            },
+          },
+        );
+        assert.equal(
+          shutdown,
+          false,
+          "pending question with no reply must park, not exit",
+        );
       } finally {
         restore();
         rmSync(dir, { recursive: true, force: true });
@@ -1720,19 +2169,41 @@ describe("subagent-done.ts", () => {
 
     it("exits when the reply arrives as a new turn (agent_start also clears the flag)", async () => {
       const dir = createTestDir();
-      const { emit, ask, restore } = setupCapturingExtension(join(dir, "s.jsonl"));
+      const { emit, ask, restore } = setupCapturingExtension(
+        join(dir, "s.jsonl"),
+      );
       try {
         emit("agent_start");
         await ask();
         let shutdown1 = false;
-        emit("agent_end", { messages: [] }, { shutdown() { shutdown1 = true; } });
+        emit(
+          "agent_end",
+          { messages: [] },
+          {
+            shutdown() {
+              shutdown1 = true;
+            },
+          },
+        );
         assert.equal(shutdown1, false, "parks while waiting");
         // Reply arrives as a fresh turn after the subagent had parked.
         emit("input");
         emit("agent_start");
         let shutdown2 = false;
-        emit("agent_end", { messages: [] }, { shutdown() { shutdown2 = true; } });
-        assert.equal(shutdown2, true, "after the reply turn, agent_end should exit");
+        emit(
+          "agent_end",
+          { messages: [] },
+          {
+            shutdown() {
+              shutdown2 = true;
+            },
+          },
+        );
+        assert.equal(
+          shutdown2,
+          true,
+          "after the reply turn, agent_end should exit",
+        );
       } finally {
         restore();
         rmSync(dir, { recursive: true, force: true });
@@ -1741,14 +2212,18 @@ describe("subagent-done.ts", () => {
   });
 });
 
-describe("tmux.ts interpretExitSidecar", () => {
-  const { interpretExitSidecar } = __pollForExitTest__;
+describe("index.ts interpretExitSidecar", () => {
+  const { interpretExitSidecar } = __completionTest__;
 
   it("no longer decodes ping payloads (ask_question keeps the session open instead)", () => {
     // ask_question writes a `.ask` signal, not a `.exit` ping sidecar, so an
     // unknown `type: "ping"` payload now falls through to a clean done.
     assert.deepEqual(
-      interpretExitSidecar({ type: "ping", name: "Worker", message: "need help" }),
+      interpretExitSidecar({
+        type: "ping",
+        name: "Worker",
+        message: "need help",
+      }),
       { reason: "done", exitCode: 0 },
     );
   });
@@ -1784,16 +2259,22 @@ describe("tmux.ts interpretExitSidecar", () => {
 
   it("treats unknown payload shapes as done", () => {
     assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
-    assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
+    assert.deepEqual(interpretExitSidecar(null), {
+      reason: "done",
+      exitCode: 0,
+    });
   });
 });
 describe("commands", () => {
   it("/subagent emits a spawn tool call for a known agent", () => {
-    const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
+    const { api, registeredCommands, sentUserMessages } =
+      createMockExtensionApi();
 
     (subagentsModule as any).default(api);
 
-    const subagent = registeredCommands.find((command) => command.name === "subagent");
+    const subagent = registeredCommands.find(
+      (command) => command.name === "subagent",
+    );
     assert.ok(subagent, "expected /subagent to be registered");
 
     subagent.handler("scout map the auth code", {
@@ -1808,8 +2289,14 @@ describe("commands", () => {
   it("does not register the removed /iterate or /plan commands", () => {
     const { api, registeredCommands } = createMockExtensionApi();
     (subagentsModule as any).default(api);
-    assert.equal(registeredCommands.find((c) => c.name === "iterate"), undefined);
-    assert.equal(registeredCommands.find((c) => c.name === "plan"), undefined);
+    assert.equal(
+      registeredCommands.find((c) => c.name === "iterate"),
+      undefined,
+    );
+    assert.equal(
+      registeredCommands.find((c) => c.name === "plan"),
+      undefined,
+    );
   });
 });
 
@@ -1823,14 +2310,18 @@ describe("tool registration", () => {
     });
   });
 
-
   it("rejects a top-level spawn with no agent and no fork", async () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
-    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    const subagentTool = registeredTools.find(
+      (tool) => tool.name === "subagent",
+    );
     assert.ok(subagentTool, "expected subagent tool to be registered");
 
-    const result = await subagentTool.execute("call-1", { name: "x", task: "do it" });
+    const result = await subagentTool.execute("call-1", {
+      name: "x",
+      task: "do it",
+    });
     assert.equal(result.details?.error, "agent required");
     assert.match(result.content[0].text, /specify which agent/i);
   });
@@ -1838,7 +2329,9 @@ describe("tool registration", () => {
   it("rejects a top-level spawn naming an unknown agent", async () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
-    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    const subagentTool = registeredTools.find(
+      (tool) => tool.name === "subagent",
+    );
     assert.ok(subagentTool, "expected subagent tool to be registered");
 
     const result = await subagentTool.execute("call-1", {
@@ -1854,7 +2347,9 @@ describe("tool registration", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
-    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    const subagentTool = registeredTools.find(
+      (tool) => tool.name === "subagent",
+    );
     assert.ok(subagentTool, "expected subagent tool to be registered");
 
     const props = subagentTool.parameters.properties;
@@ -1871,8 +2366,19 @@ describe("tool registration", () => {
     // `name` is now optional and purely cosmetic.
     assert.match(props.name.description, /cosmetic/i);
     // The removed override knobs must be gone.
-    for (const gone of ["tools", "skills", "systemPrompt", "fork", "interactive", "resumeSessionId"]) {
-      assert.equal(props[gone], undefined, `expected ${gone} param to be removed`);
+    for (const gone of [
+      "tools",
+      "skills",
+      "systemPrompt",
+      "fork",
+      "interactive",
+      "resumeSessionId",
+    ]) {
+      assert.equal(
+        props[gone],
+        undefined,
+        `expected ${gone} param to be removed`,
+      );
     }
   });
 
@@ -1880,7 +2386,9 @@ describe("tool registration", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
-    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    const subagentTool = registeredTools.find(
+      (tool) => tool.name === "subagent",
+    );
     assert.ok(subagentTool, "expected subagent tool to be registered");
 
     const theme = {
@@ -1901,7 +2409,9 @@ describe("tool registration", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
-    const messageTool = registeredTools.find((tool) => tool.name === "subagent_message");
+    const messageTool = registeredTools.find(
+      (tool) => tool.name === "subagent_message",
+    );
     assert.ok(messageTool, "expected subagent_message tool to be registered");
 
     const props = messageTool.parameters.properties;
@@ -2015,7 +2525,10 @@ describe("subagent activity snapshots", () => {
 
       for (const [index, overrides] of cases.entries()) {
         const activityFile = getSubagentActivityFile(dir, `child-${index}`);
-        const activity = validActivity({ runningChildId: `child-${index}`, ...overrides });
+        const activity = validActivity({
+          runningChildId: `child-${index}`,
+          ...overrides,
+        });
         writeFileSync(activityFile, `${JSON.stringify(activity)}\n`);
 
         const read = readSubagentActivityFile(activityFile, `child-${index}`);
@@ -2108,7 +2621,7 @@ describe("subagent interruption", () => {
       id: "a1",
       name: "Worker",
       task: "",
-      surface: "pane-1",
+      paneId: "pane-1",
       startTime: 0,
       sessionFile: "worker.jsonl",
       interactive: false,
@@ -2132,9 +2645,33 @@ describe("subagent interruption", () => {
     runningMap.clear();
 
     try {
-      runningMap.set("a1", makeRunning({ id: "a1", name: "Worker", surface: "a1", sessionFile: "a1.jsonl" }));
-      runningMap.set("b2", makeRunning({ id: "b2", name: "Worker", surface: "b2", sessionFile: "b2.jsonl" }));
-      runningMap.set("c3", makeRunning({ id: "c3", name: "Scout", surface: "c3", sessionFile: "c3.jsonl" }));
+      runningMap.set(
+        "a1",
+        makeRunning({
+          id: "a1",
+          name: "Worker",
+          paneId: "a1",
+          sessionFile: "a1.jsonl",
+        }),
+      );
+      runningMap.set(
+        "b2",
+        makeRunning({
+          id: "b2",
+          name: "Worker",
+          paneId: "b2",
+          sessionFile: "b2.jsonl",
+        }),
+      );
+      runningMap.set(
+        "c3",
+        makeRunning({
+          id: "c3",
+          name: "Scout",
+          paneId: "c3",
+          sessionFile: "c3.jsonl",
+        }),
+      );
 
       const byName = testApi.resolveRunningByName("Scout");
       assert.equal(byName.running.id, "c3");
@@ -2158,10 +2695,16 @@ describe("subagent interruption", () => {
       // No collision: base name is returned untouched.
       assert.equal(testApi.uniqueRunningName("worker"), "worker");
 
-      runningMap.set("a1", makeRunning({ id: "a1", name: "worker", surface: "a1" }));
+      runningMap.set(
+        "a1",
+        makeRunning({ id: "a1", name: "worker", paneId: "a1" }),
+      );
       assert.equal(testApi.uniqueRunningName("worker"), "worker-2");
 
-      runningMap.set("b2", makeRunning({ id: "b2", name: "worker-2", surface: "b2" }));
+      runningMap.set(
+        "b2",
+        makeRunning({ id: "b2", name: "worker-2", paneId: "b2" }),
+      );
       assert.equal(testApi.uniqueRunningName("worker"), "worker-3");
 
       // A distinct base is unaffected by the worker collisions.
@@ -2182,7 +2725,10 @@ describe("subagent interruption", () => {
       // A finished subagent's name lives in the registry even though nothing is
       // running — a fresh default must skip it so names stay unique session-wide.
       const registryNames = new Set(["worker", "worker-2"]);
-      assert.equal(testApi.uniqueRunningName("worker", registryNames), "worker-3");
+      assert.equal(
+        testApi.uniqueRunningName("worker", registryNames),
+        "worker-3",
+      );
       // A name not in the registry (or running/reserved) is unaffected.
       assert.equal(testApi.uniqueRunningName("scout", registryNames), "scout");
       // An empty registry behaves like before.
@@ -2214,37 +2760,41 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("steers a running subagent by typing into its pane (newlines flattened)", () => {
+  it("delivers a steer as one turn with newlines preserved", async () => {
     const testApi = (subagentsModule as any).__test__;
-    let sentSurface = "";
+    let sentPane = "";
     let sentText = "";
     const running = makeRunning();
 
-    const result = testApi.steerSubagent(running, "do this\nthen that", (surface: string, text: string) => {
-      sentSurface = surface;
-      sentText = text;
-    });
+    const result = await testApi.steerSubagent(
+      running,
+      "do this\nthen that",
+      async (paneId: string, text: string) => {
+        sentPane = paneId;
+        sentText = text;
+      },
+    );
 
     assert.deepEqual(result, { ok: true });
-    assert.equal(sentSurface, "pane-1");
-    assert.equal(sentText, "do this then that");
+    assert.equal(sentPane, "pane-1");
+    assert.equal(sentText, "do this\nthen that");
   });
 
-  it("returns an explicit error when steering delivery fails", () => {
+  it("returns an explicit error when steering delivery fails", async () => {
     const testApi = (subagentsModule as any).__test__;
     const running = makeRunning();
 
-    const result = testApi.steerSubagent(running, "hi", () => {
-      throw new Error("mux write failed");
+    const result = await testApi.steerSubagent(running, "hi", async () => {
+      throw new Error("Herdr write failed");
     });
 
     assert.match(result.error, /Failed to deliver message/);
   });
 
-  it("delivers a steer message and forces local status waiting", () => {
+  it("delivers a steer message and forces local status waiting", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
-    let sentSurface = "";
+    let sentPane = "";
     let sentText = "";
     runningMap.clear();
 
@@ -2266,17 +2816,29 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning({ statusState: activeState }));
 
-      const result = withMockedNow(20_000, () =>
-        testApi.handleSubagentSteer({ name: "Worker", message: "keep going" }, (surface: string, text: string) => {
-          sentSurface = surface;
-          sentText = text;
-        }),
+      const result = await withMockedNow(20_000, () =>
+        testApi.handleSubagentSteer(
+          { name: "Worker", message: "keep going" },
+          async (paneId: string, text: string) => {
+            sentPane = paneId;
+            sentText = text;
+          },
+        ),
       );
 
-      assert.equal(sentSurface, "pane-1");
+      assert.equal(sentPane, "pane-1");
       assert.equal(sentText, "keep going");
-      assert.equal(result.content[0].text.includes('Message delivered to running subagent "Worker"'), true);
-      assert.deepEqual(result.details, { id: "a1", name: "Worker", status: "steered" });
+      assert.equal(
+        result.content[0].text.includes(
+          'Message delivered to running subagent "Worker"',
+        ),
+        true,
+      );
+      assert.deepEqual(result.details, {
+        id: "a1",
+        name: "Worker",
+        status: "steered",
+      });
       const snapshot = classifyStatus(runningMap.get("a1").statusState, 20_000);
       assert.equal(snapshot.kind, "waiting");
       assert.equal(runningMap.has("a1"), true);
@@ -2285,20 +2847,23 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("requires a message when steering", () => {
+  it("requires a message when steering", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     runningMap.clear();
     try {
       runningMap.set("a1", makeRunning());
-      const result = testApi.handleSubagentSteer({ name: "Worker", message: "  " }, () => {});
+      const result = await testApi.handleSubagentSteer(
+        { name: "Worker", message: "  " },
+        async () => {},
+      );
       assert.match(result.content[0].text, /`message` is required/);
     } finally {
       runningMap.clear();
     }
   });
 
-  it("leaves status unchanged when steering delivery fails in the tool path", () => {
+  it("leaves status unchanged when steering delivery fails in the tool path", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     runningMap.clear();
@@ -2321,14 +2886,89 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning({ statusState: activeState }));
 
-      const result = withMockedNow(20_000, () =>
-        testApi.handleSubagentSteer({ name: "Worker", message: "go" }, () => {
-          throw new Error("mux write failed");
-        }),
+      const result = await withMockedNow(20_000, () =>
+        testApi.handleSubagentSteer(
+          { name: "Worker", message: "go" },
+          async () => {
+            throw new Error("Herdr write failed");
+          },
+        ),
       );
 
       assert.match(result.content[0].text, /Failed to deliver message/);
-      assert.equal(classifyStatus(runningMap.get("a1").statusState, 20_000).kind, "active");
+      assert.equal(
+        classifyStatus(runningMap.get("a1").statusState, 20_000).kind,
+        "active",
+      );
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("reports a blocked target instead of typing into the dialog", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const running = makeRunning();
+    // A blocked target must be reported before any transport runs; the
+    // scripted runner stays unused (zero calls).
+    const { runner, calls } = scriptedHerdr([{ code: 0, stdout: "{}" }]);
+    await withHerdrRunner(runner, async () => {
+      const result = await testApi.steerSubagent(running, "hi", async () => {
+        throw new HerdrError("agent_blocked", "waiting at a question dialog");
+      });
+      assert.match(result.error, /blocked at a dialog/);
+      assert.match(result.error, /message was not sent/);
+      assert.equal(calls.length, 0, "nothing may be typed into the dialog");
+    });
+  });
+
+  it("degrades a stalled steer once through text + enter", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const running = makeRunning();
+    const { runner, calls } = scriptedHerdr([
+      { code: 0, stdout: "{}" }, // pane send-text
+      { code: 0, stdout: "{}" }, // pane wait-output (echo probe)
+      { code: 0, stdout: "{}" }, // pane send-keys enter
+    ]);
+    await withHerdrRunner(runner, async () => {
+      const result = await testApi.steerSubagent(
+        running,
+        "line one\nline two",
+        async () => {
+          // Herdr documents a stalled submission as input lost — the one
+          // failure that may fall back without risking a double delivery.
+          throw new HerdrError("agent_prompt_stalled", "input lost");
+        },
+      );
+      assert.deepEqual(result, { ok: true, degraded: true });
+      assert.deepEqual(calls[0].slice(1), [
+        "pane",
+        "send-text",
+        "pane-1",
+        "line one\nline two",
+      ]);
+      assert.deepEqual(calls[2].slice(1), [
+        "pane",
+        "send-keys",
+        "pane-1",
+        "enter",
+      ]);
+    });
+  });
+
+  it("reports an unknown target without sending any pane input", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    let delivered = 0;
+    try {
+      const result = await testApi.handleSubagentSteer(
+        { name: "ghost", message: "hi" },
+        async () => {
+          delivered += 1;
+        },
+      );
+      assert.match(result.details.error, /No running subagent named "ghost"/);
+      assert.equal(delivered, 0, "no transport may run for an unknown target");
     } finally {
       runningMap.clear();
     }
@@ -2375,7 +3015,10 @@ describe("subagent interruption", () => {
 
     assert.match(presentation, /Sub-agent "Worker" failed/);
     assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
-    assert.match(presentation, /Error: Anthropic 529 Overloaded after 3 retries/);
+    assert.match(
+      presentation,
+      /Error: Anthropic 529 Overloaded after 3 retries/,
+    );
     assert.match(presentation, /subagent_message\(\{ name: "Worker"/);
     assert.doesNotMatch(presentation, /Session id:/);
     assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
@@ -2401,8 +3044,13 @@ describe("subagent status renderer", () => {
     const { api, registeredMessageRenderers } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
-    const rendererEntry = registeredMessageRenderers.find((entry) => entry.name === "subagent_status");
-    assert.ok(rendererEntry, "expected subagent_status renderer to be registered");
+    const rendererEntry = registeredMessageRenderers.find(
+      (entry) => entry.name === "subagent_status",
+    );
+    assert.ok(
+      rendererEntry,
+      "expected subagent_status renderer to be registered",
+    );
 
     const visibleLines = [
       "Worker running 5m, active (bash 2m).",
@@ -2426,7 +3074,10 @@ describe("subagent status renderer", () => {
 
     assert.match(output, /Subagent status/);
     for (const line of visibleLines) {
-      assert.match(output, new RegExp(line.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      assert.match(
+        output,
+        new RegExp(line.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+      );
     }
     assert.match(output, /\+2 more running\./);
   });
@@ -2435,14 +3086,22 @@ describe("subagent status renderer", () => {
     const { api, registeredMessageRenderers } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
-    const rendererEntry = registeredMessageRenderers.find((entry) => entry.name === "subagent_status");
-    assert.ok(rendererEntry, "expected subagent_status renderer to be registered");
+    const rendererEntry = registeredMessageRenderers.find(
+      (entry) => entry.name === "subagent_status",
+    );
+    assert.ok(
+      rendererEntry,
+      "expected subagent_status renderer to be registered",
+    );
 
     const rendered = rendererEntry.renderer(
       {
         customType: "subagent_status",
         content: "Subagent status:\n• Worker running 5m, active (bash 2m).",
-        details: { lines: ["Worker running 5m, active (bash 2m)."], overflow: 0 },
+        details: {
+          lines: ["Worker running 5m, active (bash 2m)."],
+          overflow: 0,
+        },
       },
       { expanded: true },
       createTheme(),
@@ -2459,37 +3118,6 @@ describe("subagent status renderer", () => {
   });
 });
 
-describe("subagent startup delay", () => {
-  it("defaults to 500ms when no env var is set", () => {
-    const testApi = (subagentsModule as any).__test__;
-    assert.ok(testApi, "expected subagents test helpers to be exported");
-    assert.equal(typeof testApi.getShellReadyDelayMs, "function");
-
-    const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    try {
-      assert.equal(testApi.getShellReadyDelayMs(), 500);
-    } finally {
-      if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-      else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
-    }
-  });
-
-  it("uses PI_SUBAGENT_SHELL_READY_DELAY_MS when it is set", () => {
-    const testApi = (subagentsModule as any).__test__;
-    assert.ok(testApi, "expected subagents test helpers to be exported");
-    assert.equal(typeof testApi.getShellReadyDelayMs, "function");
-
-    const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "2500";
-    try {
-      assert.equal(testApi.getShellReadyDelayMs(), 2500);
-    } finally {
-      if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-      else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
-    }
-  });
-});
 describe("subagents widget rendering", () => {
   it("keeps every rendered line within a very narrow width", () => {
     const testApi = (subagentsModule as any).__test__;
@@ -2499,35 +3127,47 @@ describe("subagents widget rendering", () => {
     const originalNow = Date.now;
     Date.now = () => 1_000_000;
     try {
-      const lines = testApi.renderSubagentWidgetLines([
-        {
-          id: "a1",
-          name: "A",
-          task: "",
-          surface: "s1",
-          startTime: 1_000_000 - 13_000,
-          sessionFile: "sess1",
-          statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 13_000 }),
-        },
-        {
-          id: "a2",
-          name: "B",
-          task: "",
-          surface: "s2",
-          startTime: 1_000_000 - 21_000,
-          sessionFile: "sess2",
-          statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 21_000 }),
-        },
-        {
-          id: "a3",
-          name: "C",
-          task: "",
-          surface: "s3",
-          startTime: 1_000_000 - 27_000,
-          sessionFile: "sess3",
-          statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 27_000 }),
-        },
-      ], 16);
+      const lines = testApi.renderSubagentWidgetLines(
+        [
+          {
+            id: "a1",
+            name: "A",
+            task: "",
+            paneId: "s1",
+            startTime: 1_000_000 - 13_000,
+            sessionFile: "sess1",
+            statusState: createStatusState({
+              source: "pi",
+              startTimeMs: 1_000_000 - 13_000,
+            }),
+          },
+          {
+            id: "a2",
+            name: "B",
+            task: "",
+            paneId: "s2",
+            startTime: 1_000_000 - 21_000,
+            sessionFile: "sess2",
+            statusState: createStatusState({
+              source: "pi",
+              startTimeMs: 1_000_000 - 21_000,
+            }),
+          },
+          {
+            id: "a3",
+            name: "C",
+            task: "",
+            paneId: "s3",
+            startTime: 1_000_000 - 27_000,
+            sessionFile: "sess3",
+            statusState: createStatusState({
+              source: "pi",
+              startTimeMs: 1_000_000 - 27_000,
+            }),
+          },
+        ],
+        16,
+      );
 
       assert.deepEqual(
         lines.map((line: string) => visibleWidth(line)),
@@ -2555,17 +3195,23 @@ describe("subagents widget rendering", () => {
     const widths = [0, 1, 2];
     for (const width of widths) {
       const startTime = Date.now() - 5_000;
-      const lines = testApi.renderSubagentWidgetLines([
-        {
-          id: "a1",
-          name: "A",
-          task: "",
-          surface: "s1",
-          startTime,
-          sessionFile: "sess1",
-          statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
-        },
-      ], width);
+      const lines = testApi.renderSubagentWidgetLines(
+        [
+          {
+            id: "a1",
+            name: "A",
+            task: "",
+            paneId: "s1",
+            startTime,
+            sessionFile: "sess1",
+            statusState: createStatusState({
+              source: "pi",
+              startTimeMs: startTime,
+            }),
+          },
+        ],
+        width,
+      );
 
       for (const line of lines) {
         assert.ok(
@@ -2600,7 +3246,10 @@ describe("subagent display helpers", () => {
   describe("formatContextUsage", () => {
     it("shows a percent gauge when the window is known", () => {
       assert.equal(testApi.formatContextUsage(36_000, 200_000), "18.0%/200k");
-      assert.equal(testApi.formatContextUsage(500_000, 1_000_000), "50.0%/1.0M");
+      assert.equal(
+        testApi.formatContextUsage(500_000, 1_000_000),
+        "50.0%/1.0M",
+      );
     });
 
     it("falls back to a window-less ctx label when unknown", () => {
@@ -2652,27 +3301,1119 @@ describe("subagent display helpers", () => {
   });
 });
 
-describe("tmux.ts", () => {
-  describe("shellEscape", () => {
-    it("wraps in single quotes", () => {
-      assert.equal(shellEscape("hello"), "'hello'");
+describe("shell.ts", () => {
+  describe("resolveShellSpec", () => {
+    it("honours the PI_SUBAGENT_SHELL override over platform defaults", () => {
+      const spec = resolveShellSpec({
+        env: { PI_SUBAGENT_SHELL: "powershell" },
+        platform: "darwin",
+      });
+      assert.equal(spec.kind, "powershell");
+      assert.equal(spec.executable, "powershell.exe");
     });
 
-    it("escapes single quotes", () => {
-      assert.equal(shellEscape("it's"), "'it'\\''s'");
+    it("override names a family: zsh on Windows resolves to the POSIX family", () => {
+      const spec = resolveShellSpec({
+        env: { PI_SUBAGENT_SHELL: "zsh" },
+        platform: "win32",
+      });
+      assert.equal(spec.kind, "posix");
+      assert.equal(spec.executable, "/bin/zsh");
+      assert.equal(spec.scriptExtension, ".sh");
     });
 
-    it("handles empty string", () => {
-      assert.equal(shellEscape(""), "''");
+    it("override accepts a full shell path", () => {
+      const spec = resolveShellSpec({
+        env: { PI_SUBAGENT_SHELL: "/opt/homebrew/bin/zsh" },
+        platform: "win32",
+      });
+      assert.equal(spec.kind, "posix");
+      assert.equal(spec.executable, "/opt/homebrew/bin/zsh");
     });
 
-    it("handles special characters", () => {
-      const input = 'echo "hello $world" && rm -rf /';
-      const escaped = shellEscape(input);
-      assert.ok(escaped.startsWith("'"));
-      assert.ok(escaped.endsWith("'"));
-      // Inside single quotes, everything is literal
-      assert.ok(escaped.includes("$world"));
+    it("override accepts pwsh and preserves it as the executable", () => {
+      const spec = resolveShellSpec({
+        env: { PI_SUBAGENT_SHELL: "pwsh" },
+        platform: "win32",
+      });
+      assert.equal(spec.kind, "powershell");
+      assert.equal(spec.executable, "pwsh.exe");
     });
+
+    it("rejects unsupported overrides", () => {
+      assert.throws(
+        () =>
+          resolveShellSpec({
+            env: { PI_SUBAGENT_SHELL: "tcsh" },
+            platform: "darwin",
+          }),
+        /PI_SUBAGENT_SHELL/,
+      );
+    });
+
+    it("macOS uses $SHELL when it is zsh", () => {
+      const spec = resolveShellSpec({
+        env: { SHELL: "/bin/zsh" },
+        platform: "darwin",
+      });
+      assert.equal(spec.kind, "posix");
+      assert.equal(spec.executable, "/bin/zsh");
+    });
+
+    it("macOS uses $SHELL when it is bash", () => {
+      const spec = resolveShellSpec({
+        env: { SHELL: "/opt/homebrew/bin/bash" },
+        platform: "darwin",
+      });
+      assert.equal(spec.kind, "posix");
+      assert.equal(spec.executable, "/opt/homebrew/bin/bash");
+    });
+
+    it("macOS falls back to /bin/zsh when $SHELL is not zsh or bash", () => {
+      assert.equal(
+        resolveShellSpec({
+          env: { SHELL: "/usr/bin/fish" },
+          platform: "darwin",
+        }).executable,
+        "/bin/zsh",
+      );
+      assert.equal(
+        resolveShellSpec({ env: {}, platform: "darwin" }).executable,
+        "/bin/zsh",
+      );
+    });
+
+    it("Windows resolves to PowerShell by default", () => {
+      const spec = resolveShellSpec({ env: {}, platform: "win32" });
+      assert.equal(spec.kind, "powershell");
+      assert.equal(spec.executable, "powershell.exe");
+      assert.equal(spec.scriptExtension, ".ps1");
+    });
+  });
+
+  describe("quoteArg", () => {
+    it("posix wraps in single quotes and escapes embedded quotes with '\\''", () => {
+      assert.equal(quoteArg("posix", "hello"), "'hello'");
+      assert.equal(quoteArg("posix", "it's"), "'it'\\''s'");
+      assert.equal(quoteArg("posix", ""), "''");
+    });
+
+    it("posix keeps $, backticks, double quotes, =, non-ASCII, and newlines literal", () => {
+      assert.equal(
+        quoteArg("posix", '$HOME `cmd` "q" a=b héllo\nline2'),
+        "'$HOME `cmd` \"q\" a=b héllo\nline2'",
+      );
+    });
+
+    it("powershell wraps in single quotes and escapes embedded quotes by doubling", () => {
+      assert.equal(quoteArg("powershell", "hello"), "'hello'");
+      assert.equal(quoteArg("powershell", "it's"), "'it''s'");
+      assert.equal(quoteArg("powershell", ""), "''");
+    });
+
+    it("powershell keeps $, backticks, and double quotes literal without escapes", () => {
+      assert.equal(
+        quoteArg("powershell", '$HOME `cmd` "q" a=b'),
+        "'$HOME `cmd` \"q\" a=b'",
+      );
+    });
+
+    it("never applies one family's rules to the other", () => {
+      assert.notEqual(
+        quoteArg("posix", "it's"),
+        quoteArg("powershell", "it's"),
+      );
+      assert.ok(!quoteArg("powershell", "it's").includes("\\''"));
+      assert.equal(quoteArg("powershell", "back`tick"), "'back`tick'");
+    });
+  });
+
+  describe("launch scripts", () => {
+    it("renders the invocation through the resolved shell, not a hardcoded bash", () => {
+      const spec = resolveShellSpec({
+        env: { SHELL: "/bin/zsh" },
+        platform: "darwin",
+      });
+      assert.equal(
+        renderInvocation(spec, "/tmp/dir with space/s.sh"),
+        "/bin/zsh '/tmp/dir with space/s.sh'",
+      );
+    });
+
+    it("renders PowerShell invocation with hardening flags and -File", () => {
+      const spec = resolveShellSpec({ env: {}, platform: "win32" });
+      assert.equal(
+        renderInvocation(spec, "C:\\Users\\a b\\s.ps1"),
+        "powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\\Users\\a b\\s.ps1'",
+      );
+    });
+
+    it("writes .sh for POSIX and .ps1 for PowerShell, including into directories with spaces", () => {
+      const dir = mkdtempSync(join(tmpdir(), "pi-shell-test-"));
+      try {
+        const posixSpec = resolveShellSpec({
+          env: { SHELL: "/bin/zsh" },
+          platform: "darwin",
+        });
+        const shPath = writeLaunchScript(posixSpec, dir, "pi --session x", {
+          baseName: "subagent-1",
+        });
+        assert.ok(shPath.endsWith(".sh"));
+        const sh = readFileSync(shPath, "utf8");
+        assert.ok(sh.startsWith("#!/bin/sh"));
+        assert.ok(sh.includes("pi --session x"));
+        assert.ok(sh.trimEnd().endsWith('exit "$?"'));
+
+        const psSpec = resolveShellSpec({ env: {}, platform: "win32" });
+        const psPath = writeLaunchScript(
+          psSpec,
+          join(dir, "dir with spaces"),
+          "pi --session y",
+          { baseName: "subagent-2" },
+        );
+        assert.ok(psPath.endsWith(".ps1"));
+        const ps = readFileSync(psPath, "utf8");
+        assert.ok(!ps.startsWith("#!"));
+        assert.ok(ps.includes("pi --session y"));
+        assert.ok(
+          ps.includes(
+            "if ($null -eq $code) { $code = if ($?) { 0 } else { 1 } }",
+          ),
+        );
+        assert.ok(ps.trimEnd().endsWith("exit $code"));
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("generateLaunchScript propagates the child status without suppressing failure", () => {
+      const ps = generateLaunchScript(
+        resolveShellSpec({ env: {}, platform: "win32" }),
+        "child.exe --flag",
+      );
+      assert.ok(ps.includes("child.exe --flag"));
+      assert.ok(!ps.includes("set -e"));
+      assert.ok(ps.includes("$code = $LASTEXITCODE"));
+      const sh = generateLaunchScript(
+        resolveShellSpec({ env: { SHELL: "/bin/bash" }, platform: "darwin" }),
+        "child --flag",
+      );
+      assert.ok(sh.includes("child --flag"));
+      assert.ok(sh.includes('exit "$?"'));
+    });
+  });
+
+  describe("sentinel", () => {
+    it("posix statement interpolates $? via printf", () => {
+      assert.equal(
+        renderSentinelStatement("posix"),
+        "printf '__SUBAGENT_DONE_%s__\\n' \"$?\"",
+      );
+    });
+
+    it("powershell statement braces the variable and maps $? to digits, never True", () => {
+      const statement = renderSentinelStatement("powershell");
+      assert.ok(statement.includes('Write-Output "__SUBAGENT_DONE_${code}__"'));
+      assert.ok(statement.includes("if ($?) { 0 } else { 1 }"));
+      assert.ok(!statement.includes("$LASTEXITCODE__"));
+      assert.ok(!statement.includes("__SUBAGENT_DONE_$?__"));
+      assert.ok(!statement.includes("True"));
+      // Negative Windows crash codes are normalized to unsigned digits.
+      assert.ok(statement.includes("4294967296"));
+    });
+
+    it("launch line runs the script then emits the sentinel", () => {
+      const spec = resolveShellSpec({ env: {}, platform: "win32" });
+      const line = renderLaunchLine(spec, "C:\\s.ps1");
+      assert.ok(line.startsWith("powershell.exe"));
+      assert.ok(line.includes("; Write-Output"));
+      const posixSpec = resolveShellSpec({
+        env: { SHELL: "/bin/zsh" },
+        platform: "darwin",
+      });
+      const posixLine = renderLaunchLine(posixSpec, "/s.sh");
+      assert.ok(posixLine.startsWith("/bin/zsh"));
+      assert.ok(posixLine.includes("; printf"));
+    });
+
+    it("wait regex is unbounded and parsing accepts only digit sentinels", () => {
+      assert.equal(SUBAGENT_DONE_WAIT_REGEX, "__SUBAGENT_DONE_[0-9]+__");
+      assert.equal(
+        parseSentinelExitCode("work done __SUBAGENT_DONE_0__ tail"),
+        0,
+      );
+      assert.equal(
+        parseSentinelExitCode("__SUBAGENT_DONE_3221226505__"),
+        3221226505,
+      );
+      assert.equal(parseSentinelExitCode("__SUBAGENT_DONE_True__"), null);
+      assert.equal(parseSentinelExitCode("no sentinel here"), null);
+      assert.ok(SUBAGENT_DONE_PATTERN.test("__SUBAGENT_DONE_5__"));
+    });
+  });
+});
+
+// ── herdr.ts ──
+
+interface ScriptedResponse {
+  code: number;
+  stdout?: string;
+  stderr?: string;
+}
+
+function scriptedHerdr(responses: ScriptedResponse[]) {
+  const calls: string[][] = [];
+  let index = 0;
+  const runner: HerdrRunner = async (file, args) => {
+    calls.push([file, ...args]);
+    const next = responses[Math.min(index, responses.length - 1)];
+    index += 1;
+    return {
+      code: next.code,
+      stdout: next.stdout ?? "",
+      stderr: next.stderr ?? "",
+    };
+  };
+  return { runner, calls };
+}
+
+async function withHerdrRunner<T>(
+  runner: HerdrRunner,
+  fn: () => Promise<T>,
+): Promise<T> {
+  __herdrTestHooks__.setRunner(runner);
+  try {
+    return await fn();
+  } finally {
+    __herdrTestHooks__.resetRunner();
+  }
+}
+
+function herdrStderr(code: string): string {
+  return JSON.stringify({
+    error: { code, message: `msg-${code}` },
+    id: "cli:probe",
+  });
+}
+
+describe("herdr.ts", () => {
+  describe("runHerdr error classification", () => {
+    it("classifies pane_not_found from JSON stderr as terminal", async () => {
+      const { runner } = scriptedHerdr([
+        { code: 1, stderr: herdrStderr("pane_not_found") },
+      ]);
+      await withHerdrRunner(runner, async () => {
+        const err = await runHerdr(["pane", "read", "nope"]).then(
+          () => null,
+          (e) => e,
+        );
+        assert.ok(err instanceof HerdrError);
+        assert.equal(err.code, "pane_not_found");
+        assert.equal(isTerminalHerdrError(err), true);
+        assert.equal(err.usageError, false);
+        assert.equal(err.exitStatus, 1);
+      });
+    });
+
+    it("classifies agent_not_found as terminal and agent_pane_busy as retryable", async () => {
+      const { runner } = scriptedHerdr([
+        { code: 1, stderr: herdrStderr("agent_not_found") },
+        { code: 1, stderr: herdrStderr("agent_pane_busy") },
+      ]);
+      await withHerdrRunner(runner, async () => {
+        const notFound = await runHerdr(["agent", "get", "w1:p1"]).then(
+          () => null,
+          (e) => e,
+        );
+        assert.ok(notFound instanceof HerdrError);
+        assert.equal(isTerminalHerdrError(notFound), true);
+        const busy = await runHerdr(["agent", "get", "w1:p1"]).then(
+          () => null,
+          (e) => e,
+        );
+        assert.ok(busy instanceof HerdrError);
+        assert.equal(busy.code, "agent_pane_busy");
+        assert.equal(isTerminalHerdrError(busy), false);
+      });
+    });
+
+    it("classifies agent_prompt_stalled and timeout as distinct codes", async () => {
+      const { runner } = scriptedHerdr([
+        { code: 1, stderr: herdrStderr("agent_prompt_stalled") },
+        { code: 1, stderr: herdrStderr("timeout") },
+      ]);
+      await withHerdrRunner(runner, async () => {
+        const stalled = await runHerdr(["agent", "prompt", "w1:p1", "hi"]).then(
+          () => null,
+          (e) => e,
+        );
+        assert.ok(stalled instanceof HerdrError);
+        assert.equal(stalled.code, "agent_prompt_stalled");
+        const timeout = await runHerdr([
+          "pane",
+          "wait-output",
+          "--regex",
+          "x",
+          "w1:p1",
+        ]).then(
+          () => null,
+          (e) => e,
+        );
+        assert.ok(timeout instanceof HerdrError);
+        assert.equal(timeout.code, "timeout");
+      });
+    });
+
+    it("marks exit 2 without JSON stderr as a usage error", async () => {
+      const { runner } = scriptedHerdr([
+        { code: 2, stderr: "error: unexpected argument '--bogus' found" },
+      ]);
+      await withHerdrRunner(runner, async () => {
+        const err = await runHerdr(["pane", "bogus"]).then(
+          () => null,
+          (e) => e,
+        );
+        assert.ok(err instanceof HerdrError);
+        assert.equal(err.code, "unknown");
+        assert.equal(err.usageError, true);
+      });
+    });
+
+    it("treats malformed JSON, empty stderr, and unknown codes as unknown", async () => {
+      const { runner } = scriptedHerdr([
+        { code: 1, stderr: "{" },
+        { code: 1, stderr: "" },
+        {
+          code: 1,
+          stderr: JSON.stringify({ error: { code: "mystery_code" } }),
+        },
+      ]);
+      await withHerdrRunner(runner, async () => {
+        for (let i = 0; i < 3; i += 1) {
+          const err = await runHerdr(["probe"]).then(
+            () => null,
+            (e) => e,
+          );
+          assert.ok(err instanceof HerdrError);
+          assert.equal(err.code, "unknown");
+          assert.equal(err.usageError, false);
+        }
+      });
+    });
+
+    it("passes an argv array to the herdr binary, never a shell string", async () => {
+      const { runner, calls } = scriptedHerdr([
+        { code: 0, stdout: '{"id":"cli:x"}' },
+      ]);
+      await withHerdrRunner(runner, async () => {
+        await runHerdr(["pane", "list"]);
+        assert.equal(calls.length, 1);
+        assert.equal(calls[0][0], "herdr");
+        assert.deepEqual(calls[0].slice(1), ["pane", "list"]);
+      });
+    });
+
+    it("parses the success JSON envelope", () => {
+      const parsed = parseHerdrJson<{ id: string; result: { a: number } }>(
+        JSON.stringify({ id: "cli:x", result: { a: 1 } }),
+        "probe",
+      );
+      assert.equal(parsed.result.a, 1);
+      assert.throws(() => parseHerdrJson("not json", "probe"), /non-JSON/);
+    });
+  });
+
+  describe("availability and version gating", () => {
+    function statusRunner(server: Record<string, unknown>) {
+      return scriptedHerdr([
+        {
+          code: 0,
+          stdout: JSON.stringify({
+            client: { version: "0.9.0", protocol: 22 },
+            server,
+          }),
+        },
+      ]);
+    }
+
+    it("fails outside the runtime env with the setup hint and never calls the CLI", async () => {
+      const { runner, calls } = scriptedHerdr([]);
+      await withHerdrRunner(runner, async () => {
+        const res = await checkHerdrAvailability({});
+        assert.equal(res.ok, false);
+        assert.match(res.hint ?? "", /run pi inside a Herdr pane/);
+        assert.equal(calls.length, 0);
+      });
+    });
+
+    it("is available when the server meets the floor", async () => {
+      const { runner } = statusRunner({
+        status: "running",
+        version: "0.9.0",
+        protocol: 22,
+        compatible: true,
+        endpoint_compatible: true,
+      });
+      await withHerdrRunner(runner, async () => {
+        const res = await checkHerdrAvailability({
+          HERDR_ENV: "1",
+          HERDR_PANE_ID: "w1:p1",
+        });
+        assert.equal(res.ok, true);
+      });
+    });
+
+    it("refuses a server below the protocol floor with an upgrade hint", async () => {
+      const { runner } = statusRunner({
+        status: "running",
+        version: "0.8.9",
+        protocol: 21,
+        compatible: true,
+        endpoint_compatible: true,
+      });
+      await withHerdrRunner(runner, async () => {
+        const res = await checkHerdrAvailability({
+          HERDR_ENV: "1",
+          HERDR_PANE_ID: "w1:p1",
+        });
+        assert.equal(res.ok, false);
+        assert.match(res.hint ?? "", /protocol 22/);
+      });
+    });
+
+    it("refuses a server below the version floor even at protocol parity", async () => {
+      const { runner } = statusRunner({
+        status: "running",
+        version: "0.8.5",
+        protocol: 22,
+        compatible: true,
+        endpoint_compatible: true,
+      });
+      await withHerdrRunner(runner, async () => {
+        const res = await checkHerdrAvailability({
+          HERDR_ENV: "1",
+          HERDR_PANE_ID: "w1:p1",
+        });
+        assert.equal(res.ok, false);
+        assert.match(res.hint ?? "", /0\.9\.0/);
+      });
+    });
+
+    it("refuses on endpoint incompatibility", async () => {
+      const { runner } = statusRunner({
+        status: "running",
+        version: "0.9.0",
+        protocol: 22,
+        compatible: true,
+        endpoint_compatible: false,
+      });
+      await withHerdrRunner(runner, async () => {
+        const res = await checkHerdrAvailability({
+          HERDR_ENV: "1",
+          HERDR_PANE_ID: "w1:p1",
+        });
+        assert.equal(res.ok, false);
+        assert.match(res.hint ?? "", /match/);
+      });
+    });
+
+    it("refuses with the setup hint when the server is unreachable", async () => {
+      const { runner } = scriptedHerdr([
+        { code: 127, stderr: "spawn herdr ENOENT" },
+      ]);
+      await withHerdrRunner(runner, async () => {
+        const res = await checkHerdrAvailability({
+          HERDR_ENV: "1",
+          HERDR_PANE_ID: "w1:p1",
+        });
+        assert.equal(res.ok, false);
+        assert.match(res.hint ?? "", /Start Herdr/);
+      });
+    });
+
+    it("compareVersions orders three-part versions", () => {
+      assert.equal(compareVersions("0.9.0", "0.9.0"), 0);
+      assert.ok(compareVersions("0.10.0", "0.9.0") > 0);
+      assert.ok(compareVersions("0.8.9", "0.9.0") < 0);
+      assert.ok(compareVersions("1.0.0", "0.9.9") > 0);
+    });
+  });
+
+  describe("busy retry", () => {
+    it("retries agent_pane_busy then succeeds", async () => {
+      let attempts = 0;
+      const result = await runHerdrWithBusyRetry(
+        async () => {
+          attempts += 1;
+          if (attempts < 3) throw new HerdrError("agent_pane_busy", "busy");
+          return "ok";
+        },
+        { backoffMs: 0 },
+      );
+      assert.equal(result, "ok");
+      assert.equal(attempts, 3);
+    });
+
+    it("exhausts retries and throws the busy error", async () => {
+      let attempts = 0;
+      await assert.rejects(
+        () =>
+          runHerdrWithBusyRetry(
+            async () => {
+              attempts += 1;
+              throw new HerdrError("agent_pane_busy", "busy");
+            },
+            { retries: 2, backoffMs: 0 },
+          ),
+        /busy/,
+      );
+      assert.equal(attempts, 3); // initial + 2 retries
+    });
+
+    it("never retries terminal or timeout codes", async () => {
+      let terminalAttempts = 0;
+      await assert.rejects(() =>
+        runHerdrWithBusyRetry(async () => {
+          terminalAttempts += 1;
+          throw new HerdrError("pane_not_found", "gone");
+        }),
+      );
+      assert.equal(terminalAttempts, 1);
+
+      let timeoutAttempts = 0;
+      await assert.rejects(() =>
+        runHerdrWithBusyRetry(async () => {
+          timeoutAttempts += 1;
+          throw new HerdrError("timeout", "expired");
+        }),
+      );
+      assert.equal(timeoutAttempts, 1);
+    });
+  });
+
+  describe("pane operations", () => {
+    it("createHerdrPane targets the caller, never focuses, and passes cwd/env", async () => {
+      const { runner, calls } = scriptedHerdr([
+        {
+          code: 0,
+          stdout: JSON.stringify({
+            id: "cli:pane:split",
+            result: { pane_id: "w1:p9" },
+          }),
+        },
+      ]);
+      await withHerdrRunner(runner, async () => {
+        const id = await createHerdrPane({
+          cwd: "C:\\dir with spaces",
+          env: { PI_SUBAGENT_NAME: "scout", X: "a=b" },
+        });
+        assert.equal(id, "w1:p9");
+        const args = calls[0].slice(1);
+        assert.ok(args.includes("--current"));
+        assert.ok(args.includes("--no-focus"));
+        assert.ok(!args.includes("--focus"));
+        assert.equal(args[args.indexOf("--direction") + 1], "right");
+        assert.equal(args[args.indexOf("--cwd") + 1], "C:\\dir with spaces");
+        assert.deepEqual(
+          args.filter(
+            (arg, i) =>
+              (arg === "--env" && i === args.indexOf("--env")) ||
+              arg === "--env",
+          ).length,
+          2,
+        );
+        assert.ok(args.includes("PI_SUBAGENT_NAME=scout"));
+        assert.ok(args.includes("X=a=b"));
+      });
+    });
+
+    it("createHerdrPane uses an explicit target pane when given", async () => {
+      const { runner, calls } = scriptedHerdr([
+        {
+          code: 0,
+          stdout: JSON.stringify({
+            id: "cli:pane:split",
+            result: { pane_id: "w1:p3" },
+          }),
+        },
+      ]);
+      await withHerdrRunner(runner, async () => {
+        await createHerdrPane({ targetPane: "w1:p1", direction: "down" });
+        const args = calls[0].slice(1);
+        assert.deepEqual(args[args.indexOf("--pane") + 1], "w1:p1");
+        assert.ok(!args.includes("--current"));
+        assert.equal(args[args.indexOf("--direction") + 1], "down");
+      });
+    });
+
+    it("createHerdrPane rejects malformed or missing pane ids", async () => {
+      const { runner } = scriptedHerdr([
+        {
+          code: 0,
+          stdout: JSON.stringify({ id: "cli:pane:split", result: {} }),
+        },
+        {
+          code: 0,
+          stdout: JSON.stringify({
+            id: "cli:pane:split",
+            result: { pane_id: "w1 p1" },
+          }),
+        },
+      ]);
+      await withHerdrRunner(runner, async () => {
+        await assert.rejects(() => createHerdrPane(), /no valid pane id/);
+        await assert.rejects(() => createHerdrPane(), /no valid pane id/);
+      });
+    });
+
+    it("closeHerdrPane tolerates pane_not_found but propagates other failures", async () => {
+      const { runner } = scriptedHerdr([
+        { code: 1, stderr: herdrStderr("pane_not_found") },
+        { code: 1, stderr: herdrStderr("agent_not_found") },
+      ]);
+      await withHerdrRunner(runner, async () => {
+        await closeHerdrPane("w1:p9"); // already gone: success
+        await assert.rejects(() => closeHerdrPane("w1:p9"), /agent_not_found/);
+      });
+    });
+
+    it("readHerdrPane requests plain unwrapped text without --raw", async () => {
+      const { runner, calls } = scriptedHerdr([
+        { code: 0, stdout: "line one\nline two\n" },
+      ]);
+      await withHerdrRunner(runner, async () => {
+        const text = await readHerdrPane("w1:p1", 120);
+        assert.equal(text, "line one\nline two\n");
+        const args = calls[0].slice(1);
+        assert.ok(args.includes("recent-unwrapped"));
+        assert.ok(!args.includes("--raw"));
+        assert.equal(args[args.indexOf("--lines") + 1], "120");
+      });
+    });
+
+    it("waitHerdrOutput builds the regex wait and surfaces timeout distinctly", async () => {
+      const ok = scriptedHerdr([
+        { code: 0, stdout: '{"id":"cli:pane:wait_output"}' },
+      ]);
+      await withHerdrRunner(ok.runner, async () => {
+        await waitHerdrOutput("w1:p1", "__SUBAGENT_DONE_[0-9]+__", {
+          lines: 120,
+          timeoutMs: 1000,
+        });
+        const args = ok.calls[0].slice(1);
+        assert.deepEqual(
+          args[args.indexOf("--regex") + 1],
+          "__SUBAGENT_DONE_[0-9]+__",
+        );
+        assert.ok(args.includes("recent-unwrapped"));
+        assert.ok(!args.includes("--raw"));
+        assert.equal(args[args.indexOf("--timeout") + 1], "1000");
+        assert.equal(args[args.indexOf("--lines") + 1], "120");
+      });
+
+      const timedOut = scriptedHerdr([
+        { code: 1, stderr: herdrStderr("timeout") },
+      ]);
+      await withHerdrRunner(timedOut.runner, async () => {
+        const err = await waitHerdrOutput("w1:p1", "x", { timeoutMs: 50 }).then(
+          () => null,
+          (e) => e,
+        );
+        assert.ok(err instanceof HerdrError);
+        assert.equal(err.code, "timeout");
+      });
+    });
+
+    it("shellFamilyFromProcessInfo detects powershell, posix, and unknown", () => {
+      assert.equal(
+        shellFamilyFromProcessInfo({
+          process_info: { foreground_processes: [{ name: "powershell.exe" }] },
+        }),
+        "powershell",
+      );
+      assert.equal(
+        shellFamilyFromProcessInfo({
+          process_info: { foreground_processes: [{ argv: ["/bin/zsh"] }] },
+        }),
+        "posix",
+      );
+      assert.equal(
+        shellFamilyFromProcessInfo({
+          process_info: { foreground_processes: [{ name: "node.exe" }] },
+        }),
+        null,
+      );
+      assert.equal(shellFamilyFromProcessInfo({ process_info: {} }), null);
+    });
+
+    it("getHerdrAgent unwraps the CLI envelope to the agent state", async () => {
+      const { runner } = scriptedHerdr([
+        {
+          code: 0,
+          stdout: JSON.stringify({
+            id: "cli:agent:get",
+            result: { agent: { agent_status: "idle", pane_id: "w1:p1" } },
+          }),
+        },
+      ]);
+      await withHerdrRunner(runner, async () => {
+        assert.equal(await getHerdrAgent("w1:p1"), "idle");
+      });
+    });
+
+    it("assertPaneShellFamily refuses a mismatch and accepts a match", async () => {
+      const powershellInfo = {
+        code: 0,
+        stdout: JSON.stringify({
+          id: "cli:pane:process_info",
+          result: {
+            process_info: {
+              foreground_processes: [{ name: "powershell.exe" }],
+            },
+          },
+        }),
+      };
+      const { runner, calls } = scriptedHerdr([powershellInfo]);
+      await withHerdrRunner(runner, async () => {
+        await assert.rejects(
+          () => assertPaneShellFamily("w1:p1", "posix"),
+          /runs a powershell shell but the launch was rendered for posix/,
+        );
+        assert.deepEqual(calls[0].slice(1), [
+          "pane",
+          "process-info",
+          "--pane",
+          "w1:p1",
+        ]);
+        assert.equal(
+          calls.length,
+          1,
+          "a mismatch must refuse before sending anything to the pane",
+        );
+
+        // A matching family resolves without error.
+        await assert.doesNotReject(() =>
+          assertPaneShellFamily("w1:p1", "powershell"),
+        );
+      });
+    });
+  });
+});
+
+describe("orchestration pane cleanup", () => {
+  it("closes the pane when a launch step fails after pane creation", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const { runner, calls } = scriptedHerdr([
+      { code: 1, stderr: herdrStderr("unknown") }, // shell-family probe fails
+      { code: 0, stdout: "{}" }, // pane close
+    ]);
+    await withHerdrRunner(runner, async () => {
+      await assert.rejects(() =>
+        testApi.launchIntoPane({
+          paneId: "w1:p1",
+          shellSpec: resolveShellSpec({ env: {}, platform: "win32" }),
+          scriptDir: tmpdir(),
+          scriptBase: "cleanup-test",
+          childCommand: "pi",
+          preamble: "# cleanup test",
+        }),
+      );
+      assert.deepEqual(calls[1].slice(1), ["pane", "close", "w1:p1"]);
+    });
+  });
+
+  it("closes the pane and removes the running entry when the watcher is cancelled", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const { runner, calls } = scriptedHerdr([{ code: 0, stdout: "{}" }]);
+    await withHerdrRunner(runner, async () => {
+      const runningMap = testApi.runningSubagents as Map<string, any>;
+      runningMap.clear();
+      const controller = new AbortController();
+      const running = {
+        id: "cancel-1",
+        name: "CancelMe",
+        task: "t",
+        paneId: "w1:p7",
+        startTime: Date.now(),
+        sessionFile: join(tmpdir(), "nonexistent-cancel.jsonl"),
+        interactive: false,
+        statusState: createStatusState({
+          source: "pi",
+          startTimeMs: Date.now(),
+        }),
+      };
+      runningMap.set(running.id, running);
+      controller.abort();
+
+      const result = await testApi.watchSubagent(running, controller.signal);
+
+      assert.equal(result.error, "cancelled");
+      assert.equal(runningMap.has("cancel-1"), false);
+      assert.deepEqual(calls[0].slice(1), ["pane", "close", "w1:p7"]);
+      runningMap.clear();
+    });
+  });
+});
+
+describe("pending question sidecar", () => {
+  it("delivers once, consumes the sidecar, and keeps the session parked", () => {
+    const dir = createTestDir();
+    const map = (subagentsModule as any).__test__.runningSubagents as Map<
+      string,
+      any
+    >;
+    try {
+      const { api, sentMessages } = createMockExtensionApi();
+      (subagentsModule as any).default(api); // installs `latestPi`
+      const testApi = (subagentsModule as any).__test__;
+      map.clear();
+
+      const sessionFile = join(dir, "child.jsonl");
+      writeFileSync(
+        sessionFile,
+        `${JSON.stringify({ type: "session", id: "sess-q" })}\n`,
+        "utf8",
+      );
+      const running = {
+        id: "q1",
+        name: "Questioner",
+        task: "",
+        paneId: "w1:p1",
+        startTime: Date.now(),
+        sessionFile,
+        interactive: false,
+        statusState: createStatusState({
+          source: "pi",
+          startTimeMs: Date.now(),
+        }),
+      };
+      map.set(running.id, running);
+
+      const askFile = `${sessionFile}.ask`;
+      writeFileSync(
+        askFile,
+        JSON.stringify({ question: "Which database should I use?" }),
+        "utf8",
+      );
+
+      testApi.deliverPendingQuestion(running);
+      assert.equal(sentMessages.length, 1, "the question is delivered once");
+      assert.equal(sentMessages[0].message.customType, "subagent_question");
+      assert.match(
+        sentMessages[0].message.content,
+        /Which database should I use\?/,
+      );
+      assert.equal(sentMessages[0].options?.deliverAs, "steer");
+      assert.equal(existsSync(askFile), false, "the sidecar is consumed");
+      assert.equal(
+        map.has("q1"),
+        true,
+        "the session stays parked for the reply",
+      );
+
+      // A second tick with no new sidecar stays silent.
+      testApi.deliverPendingQuestion(running);
+      assert.equal(sentMessages.length, 1);
+
+      // A malformed sidecar is consumed without notifying.
+      writeFileSync(askFile, "{not json", "utf8");
+      testApi.deliverPendingQuestion(running);
+      assert.equal(sentMessages.length, 1);
+      assert.equal(existsSync(askFile), false);
+    } finally {
+      map.clear();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("task delivery gate", () => {
+  function makeGateRunning(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "gate-1",
+      name: "GateChild",
+      task: "the task",
+      paneId: "w1:p5",
+      startTime: 0,
+      sessionFile: join(tmpdir(), "gate-nonexistent.jsonl"),
+      interactive: false,
+      pendingTask: "composed task",
+      deliveryMode: undefined as "agent" | "degraded" | undefined,
+      statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+      ...overrides,
+    };
+  }
+
+  it("withholds the task until the child reports ready, then delivers it once", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const states: string[] = ["unknown", "unknown", "working", "idle"];
+    const prompts: string[] = [];
+    const running = makeGateRunning();
+
+    await testApi.deliverTaskWhenReady(running, new AbortController().signal, {
+      readState: async () => (states.shift() ?? "unknown") as any,
+      prompt: async (_paneId: string, text: string) => {
+        prompts.push(text);
+      },
+      fallback: async () => {
+        throw new Error("the fallback must not run for a ready child");
+      },
+      pollMs: 1,
+      gateTimeoutMs: 5_000,
+    });
+
+    assert.deepEqual(prompts, ["composed task"]);
+    assert.equal(
+      states.length,
+      0,
+      "every pre-ready state is observed, never assumed ready",
+    );
+    assert.equal(running.deliveryMode, "agent");
+  });
+
+  it("degrades once through the alternate transport when the gate expires", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const delivered: string[] = [];
+    const running = makeGateRunning();
+    let prompts = 0;
+
+    await testApi.deliverTaskWhenReady(running, new AbortController().signal, {
+      readState: async () => "unknown" as any,
+      prompt: async () => {
+        prompts += 1;
+      },
+      fallback: async (_paneId: string, text: string) => {
+        delivered.push(text);
+      },
+      pollMs: 5,
+      gateTimeoutMs: 40,
+    });
+
+    assert.equal(prompts, 0, "no input may be typed before readiness");
+    assert.deepEqual(delivered, ["composed task"]);
+    assert.equal(running.deliveryMode, "degraded");
+  });
+
+  it("degrades once when the agent layer reports the prompt stalled", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const delivered: string[] = [];
+    const running = makeGateRunning();
+
+    await testApi.deliverTaskWhenReady(running, new AbortController().signal, {
+      readState: async () => "idle" as any,
+      prompt: async () => {
+        throw new HerdrError("agent_prompt_stalled", "input lost");
+      },
+      fallback: async (_paneId: string, text: string) => {
+        delivered.push(text);
+      },
+    });
+
+    assert.deepEqual(delivered, ["composed task"]);
+    assert.equal(running.deliveryMode, "degraded");
+  });
+
+  it("treats an ambiguous timeout as delivered when the turn started", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const states: string[] = ["idle", "working"];
+    const running = makeGateRunning();
+
+    await testApi.deliverTaskWhenReady(running, new AbortController().signal, {
+      readState: async () => (states.shift() ?? "unknown") as any,
+      prompt: async () => {
+        throw new HerdrError("timeout", "prompt timed out");
+      },
+      fallback: async () => {
+        throw new Error("an ambiguous timeout must never re-send the task");
+      },
+    });
+
+    assert.equal(running.deliveryMode, "agent");
+  });
+
+  it("fails without re-sending when an ambiguous timeout started no turn", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const states: string[] = ["idle", "unknown"];
+    const running = makeGateRunning();
+
+    await assert.rejects(
+      () =>
+        testApi.deliverTaskWhenReady(running, new AbortController().signal, {
+          readState: async () => (states.shift() ?? "unknown") as any,
+          prompt: async () => {
+            throw new HerdrError("timeout", "prompt timed out");
+          },
+          fallback: async () => {
+            throw new Error("an ambiguous timeout must never re-send the task");
+          },
+        }),
+      /timed out before its turn started/,
+    );
+    assert.equal(running.deliveryMode, undefined);
+  });
+
+  it("reports a blocked dialog and sends nothing", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const running = makeGateRunning();
+    let sent = 0;
+
+    await assert.rejects(
+      () =>
+        testApi.deliverTaskWhenReady(running, new AbortController().signal, {
+          readState: async () => "blocked" as any,
+          prompt: async () => {
+            sent += 1;
+          },
+          fallback: async () => {
+            sent += 1;
+          },
+        }),
+      /blocked at a dialog/,
+    );
+    assert.equal(sent, 0, "nothing may be typed into a blocked dialog");
+  });
+
+  it("reports agent_blocked from the prompt without falling back", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const running = makeGateRunning();
+    let sent = 0;
+
+    await assert.rejects(
+      () =>
+        testApi.deliverTaskWhenReady(running, new AbortController().signal, {
+          readState: async () => "idle" as any,
+          prompt: async () => {
+            throw new HerdrError("agent_blocked", "dialog open");
+          },
+          fallback: async () => {
+            sent += 1;
+          },
+        }),
+      /blocked at a dialog/,
+    );
+    assert.equal(sent, 0);
+    assert.equal(running.deliveryMode, undefined);
+  });
+
+  it("does nothing when no task is pending", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const running = makeGateRunning({ pendingTask: undefined });
+    let calls = 0;
+
+    await testApi.deliverTaskWhenReady(running, new AbortController().signal, {
+      readState: async () => {
+        calls += 1;
+        return "idle" as any;
+      },
+      prompt: async () => {
+        calls += 1;
+      },
+      fallback: async () => {
+        calls += 1;
+      },
+    });
+
+    assert.equal(calls, 0);
+    assert.equal(running.deliveryMode, undefined);
   });
 });
