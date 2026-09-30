@@ -1,15 +1,18 @@
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import {
+  SUBAGENT_CONFIG_EXAMPLE_PATH,
+  SUBAGENT_CONFIG_PATH,
+  createSubagentConfigGuard,
+  parseSubagentConfigJson,
+  readSubagentConfigFile,
+} from "./config.ts";
 
 export const SNAPSHOT_STALLED_AFTER_MS = 60_000;
 export const DEFAULT_STATUS_LINE_LIMIT = 4;
 export const MAX_STATUS_NAME_LENGTH = 72;
 export const MAX_STATUS_LINE_LENGTH = 120;
 
-const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const DEFAULT_STATUS_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
-const STATUS_CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
+const DEFAULT_STATUS_CONFIG_PATH = SUBAGENT_CONFIG_PATH;
+const STATUS_CONFIG_EXAMPLE_PATH = SUBAGENT_CONFIG_EXAMPLE_PATH;
 
 export type SubagentStatusKind = "starting" | "active" | "waiting" | "stalled" | "running";
 export type SubagentStatusSource = "pi" | "claude";
@@ -83,35 +86,6 @@ export interface CappedStatusLines {
   overflow: number;
 }
 
-function invalidStatusConfig(source: string, message: string): never {
-  throw new Error(`Invalid subagent status config in ${source}: ${message}`);
-}
-
-function requireObject(value: unknown, source: string, fieldName: string): Record<string, unknown> {
-  if (value == null || typeof value !== "object" || Array.isArray(value)) {
-    invalidStatusConfig(source, `${fieldName} must be an object`);
-  }
-  return value as Record<string, unknown>;
-}
-
-function requireBoolean(value: unknown, source: string, fieldName: string): boolean {
-  if (typeof value !== "boolean") {
-    invalidStatusConfig(source, `${fieldName} must be a boolean`);
-  }
-  return value;
-}
-
-function rejectUnsupportedKeys(
-  value: Record<string, unknown>,
-  allowedKeys: string[],
-  source: string,
-  fieldName: string,
-): void {
-  const unsupportedKeys = Object.keys(value).filter((key) => !allowedKeys.includes(key));
-  if (unsupportedKeys.length > 0) {
-    invalidStatusConfig(source, `${fieldName} has unsupported key(s): ${unsupportedKeys.join(", ")}`);
-  }
-}
 
 function truncateText(text: string, maxLength: number): string {
   if (text.length <= maxLength) return text;
@@ -138,10 +112,11 @@ function activityLabel(snapshot: Pick<StatusSnapshot, "activityLabel" | "activeS
 }
 
 export function parseStatusConfig(rawConfig: unknown, source = "config.json"): StatusConfig {
-  const config = requireObject(rawConfig, source, "root");
-  const status = requireObject(config.status, source, "status");
-  rejectUnsupportedKeys(status, ["enabled"], source, "status");
-  const enabled = requireBoolean(status.enabled, source, "status.enabled");
+  const guard = createSubagentConfigGuard(source, "subagent status");
+  const config = guard.requireObject(rawConfig, "root");
+  const status = guard.requireObject(config.status, "status");
+  guard.rejectUnsupportedKeys(status, ["enabled"], "status");
+  const enabled = guard.requireBoolean(status.enabled, "status.enabled");
 
   return {
     enabled,
@@ -149,42 +124,19 @@ export function parseStatusConfig(rawConfig: unknown, source = "config.json"): S
   };
 }
 
-function readStatusConfigFile(configPath: string, examplePath: string): { sourcePath: string; rawConfig: string } {
-  try {
-    return { sourcePath: configPath, rawConfig: readFileSync(configPath, "utf8") };
-  } catch (error) {
-    const errno = error as NodeJS.ErrnoException;
-    if (errno.code !== "ENOENT") throw error;
-  }
-
-  try {
-    return { sourcePath: examplePath, rawConfig: readFileSync(examplePath, "utf8") };
-  } catch (error) {
-    const errno = error as NodeJS.ErrnoException;
-    if (errno.code === "ENOENT") {
-      throw new Error(
-        `Missing subagent status config. Expected ${configPath} or ${examplePath}.`,
-      );
-    }
-    throw error;
-  }
-}
-
 export function loadStatusConfig(
   configPath = DEFAULT_STATUS_CONFIG_PATH,
   examplePath = STATUS_CONFIG_EXAMPLE_PATH,
 ): StatusConfig {
-  const { sourcePath, rawConfig } = readStatusConfigFile(configPath, examplePath);
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(rawConfig) as unknown;
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`Invalid JSON in subagent config ${sourcePath}: ${detail}`);
+  const read = readSubagentConfigFile(configPath, examplePath);
+  if (!read) {
+    throw new Error(`Missing subagent status config. Expected ${configPath} or ${examplePath}.`);
   }
 
-  return parseStatusConfig(parsed, sourcePath);
+  return parseStatusConfig(
+    parseSubagentConfigJson(read.rawConfig, read.sourcePath),
+    read.sourcePath,
+  );
 }
 
 export function formatElapsedDuration(ms: number): string {

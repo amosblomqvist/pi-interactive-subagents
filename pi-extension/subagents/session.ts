@@ -98,7 +98,11 @@ export interface SubagentLoadout {
   agent: string | null;
   /** The `--tools` allowlist string, or null when the spawn was unrestricted. */
   toolAllowlist: string | null;
-  /** Model id (without thinking suffix), or null to use the session default. */
+  /**
+   * Model token: a literal `provider/modelId`, the inherit token, or null to
+   * use the session default. The inherit token is kept unresolved here so a
+   * resume can re-resolve it against the parent session.
+   */
   model: string | null;
   /** Thinking level appended to the model as `model:level`, or null. */
   thinking: string | null;

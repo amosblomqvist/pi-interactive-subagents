@@ -55,6 +55,27 @@ import {
   loadStatusConfig,
 } from "./status.ts";
 import {
+  INHERIT_TOKEN,
+  THINKING_LEVELS,
+  findAvailableModel,
+  formatModelSource,
+  loadSubagentConfig,
+  resolveLoadoutModel,
+  resolveSubagentModel,
+  supportedThinkingLevels,
+  writeModelSelection,
+  type ModelCatalog,
+  type ResolvedModel,
+  type SubagentConfig,
+  type ThinkingLevelName,
+} from "./config.ts";
+import {
+  buildModelPickerItems,
+  ModelPickerComponent,
+  type ModelPickerItem,
+  type ModelPickerModel,
+} from "./model-picker.ts";
+import {
   getSubagentActivityFile,
   readSubagentActivityFile,
   type ActivityReadResult,
@@ -835,10 +856,15 @@ function buildSubagentToolAllowlist(
 function applySandboxToParts(
   parts: string[],
   loadout: SubagentLoadout,
-  opts: { artifactDir: string; name: string },
+  opts: { artifactDir: string; name: string; model?: string | null; thinking?: string | null },
 ): void {
-  if (loadout.model) {
-    const model = loadout.thinking ? `${loadout.model}:${loadout.thinking}` : loadout.model;
+  // `opts.model` overrides the snapshot for callers that re-resolve the inherit
+  // token. The token itself is never a model id, so it is never passed along.
+  const snapshotModel = opts.model !== undefined ? opts.model : loadout.model;
+  const effectiveModel = snapshotModel === INHERIT_TOKEN ? null : snapshotModel;
+  const effectiveThinking = opts.thinking !== undefined ? opts.thinking : loadout.thinking;
+  if (effectiveModel) {
+    const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel;
     parts.push("--model", shellEscape(model));
   }
 
@@ -860,6 +886,12 @@ function applySandboxToParts(
   // Default-deny: disable global extension discovery and re-enable only the
   // extensions backing the whitelisted tools. A null allowlist means the spawn
   // was intentionally unrestricted (e.g. a fork clone) and is replayed as-is.
+  //
+  // Note for anyone fixing the provider-extension case (issue #12): a provider
+  // backs no tool, so it is missing from this whitelist and the child cannot
+  // resolve `--model`. Derive that provider from `effectiveModel` above, never
+  // from `loadout.model` — that field may hold the inherit token, which is not
+  // a model id.
   if (loadout.toolAllowlist) {
     parts.push("--no-extensions");
     parts.push("--tools", shellEscape(loadout.toolAllowlist));
@@ -1130,6 +1162,8 @@ export const __test__ = {
   resolveEffectiveInteractive,
   buildSubagentToolAllowlist,
   applySandboxToParts,
+  formatAgentModelTag,
+  unknownConfiguredAgentNames,
   buildPiPromptArgs,
   formatWidgetRightLabel,
   observeRunningSubagent,
@@ -1160,6 +1194,164 @@ function startWidgetRefresh() {
 }
 
 /**
+ * Snapshot the session's model environment for resolution and validation.
+ *
+ * An absent context yields an empty catalogue, which disables validation rather
+ * than rejecting every configured model. A running pi always has at least one
+ * model with credentials, so an empty catalogue means "unknown", not "none".
+ */
+function buildModelCatalog(ctx: ExtensionContext | undefined): ModelCatalog {
+  const available = (ctx?.modelRegistry?.getAvailable() ?? []).map((model) => ({
+    provider: model.provider,
+    id: model.id,
+    name: model.name,
+    reasoning: model.reasoning,
+    supportedThinking: supportedThinkingLevels(model),
+  }));
+  return {
+    parentModel: ctx?.model ? `${ctx.model.provider}/${ctx.model.id}` : null,
+    parentThinking: ctx?.thinkingLevel ?? null,
+    parentSupportedThinking: ctx?.model ? supportedThinkingLevels(ctx.model) : undefined,
+    available,
+  };
+}
+
+/**
+ * Resolve a sub-agent's model: the per-agent config pick, then the spawn
+ * parameter, then the config default, then the agent frontmatter. Throws when
+ * the resolved model is unusable and `models.fallback` is `fail`.
+ */
+function resolveModelForSpawn(
+  params: typeof SubagentParams.static,
+  agentDefs: AgentDefaults | null,
+  ctx: ExtensionContext,
+): ResolvedModel {
+  const resolved = resolveSubagentModel({
+    param: params.model ?? null,
+    agentName: params.agent ?? null,
+    agentModel: agentDefs?.model ?? null,
+    agentThinking: agentDefs?.thinking ?? null,
+    config: loadSubagentConfig(),
+    catalog: buildModelCatalog(ctx),
+  });
+
+  if (resolved.error) throw new Error(resolved.error);
+  if (resolved.warning) ctx.ui.notify(resolved.warning, "warning");
+  return resolved;
+}
+
+/** Config agent names that match no discovered agent, sorted for display. */
+function unknownConfiguredAgentNames(
+  config: SubagentConfig,
+  knownNames: Iterable<string>,
+): string[] {
+  const known = new Set(knownNames);
+  return Object.keys(config.models?.agents ?? {})
+    .filter((name) => !known.has(name))
+    .sort();
+}
+
+/** Sentinel value the picker returns for "reset to the agent's own model". */
+const RESET_MODEL_CHOICE = "reset-to-the-agents-own-model";
+
+/** Sentinel value the thinking step returns for "reset to inherited/default". */
+const RESET_THINKING_CHOICE = "reset-to-inherited-thinking";
+
+/** Sentinel value the thinking step returns for "leave thinking unchanged". */
+const LEAVE_THINKING_CHOICE = "leave-thinking-unchanged";
+
+/** Thinking levels a model token supports; `inherit` follows the parent model. */
+function supportedThinkingForToken(
+  token: string | null,
+  catalog: ModelCatalog,
+): readonly ThinkingLevelName[] {
+  if (token === INHERIT_TOKEN) {
+    return catalog.parentSupportedThinking ?? THINKING_LEVELS;
+  }
+  if (token) {
+    const match = findAvailableModel(token, catalog.available);
+    if (match?.supportedThinking) return match.supportedThinking;
+  }
+  return THINKING_LEVELS;
+}
+
+/** Build the thinking step rows, flagging the target's current effective level. */
+function buildThinkingItems(
+  levels: readonly ThinkingLevelName[],
+  currentThinking: ThinkingLevelName | null,
+): ModelPickerItem[] {
+  const items: ModelPickerItem[] = [
+    {
+      value: LEAVE_THINKING_CHOICE,
+      label: "leave thinking unchanged",
+      searchText: "leave thinking unchanged",
+    },
+    {
+      value: RESET_THINKING_CHOICE,
+      label: "reset to inherited/default",
+      searchText: "reset to inherited default thinking",
+    },
+    ...levels.map((level) => ({ value: level, label: level, searchText: level })),
+  ];
+
+  const currentIndex =
+    currentThinking === null
+      ? items.findIndex((item) => item.value === RESET_THINKING_CHOICE)
+      : items.findIndex((item) => item.value === currentThinking);
+  if (currentIndex >= 0) items[currentIndex] = { ...items[currentIndex], current: true };
+  return items;
+}
+
+/** Models offered by /subagent-model: the session's scoped set, else the credentialed catalogue. */
+function collectPickableModels(ctx: ExtensionContext): ModelPickerModel[] {
+  const scopedModels = ctx.scopedModels ?? [];
+  if (scopedModels.length > 0) {
+    return scopedModels.map((entry) => entry.model);
+  }
+
+  const registry = ctx.modelRegistry;
+  return (registry?.getAvailable() ?? []).filter(
+    (model) => !registry?.hasConfiguredAuth || registry.hasConfiguredAuth(model),
+  );
+}
+
+/** Show the scrollable picker in TUI mode, falling back to the plain selector elsewhere. */
+async function pickModelChoice(
+  ctx: ExtensionContext,
+  title: string,
+  items: readonly ModelPickerItem[],
+): Promise<string | undefined> {
+  if (ctx.mode !== "tui") {
+    const chosenLabel = await ctx.ui.select(`${title}:`, items.map((item) => item.label));
+    return items.find((item) => item.label === chosenLabel)?.value;
+  }
+
+  return ctx.ui.custom<string | undefined>((_tui, theme, _keybindings, done) =>
+    new ModelPickerComponent(theme, { title, items }, done),
+  );
+}
+
+/** Separator between a model id and its source in the `subagents_list` tag. */
+const MODEL_TAG_SEPARATOR = " · ";
+
+/** Stand-in when an unavailable model has no id to show. */
+const UNKNOWN_MODEL_LABEL = "model";
+
+/**
+ * Short model tag for `subagents_list`: the model that will really run, plus
+ * where it came from. Reports an unavailable model instead of hiding it.
+ */
+function formatAgentModelTag(resolved: ResolvedModel, agentModel: string | null): string {
+  if (resolved.command) {
+    return ` [${resolved.command}${MODEL_TAG_SEPARATOR}${formatModelSource(resolved.source)}]`;
+  }
+  if (resolved.error || resolved.warning) {
+    return ` [${agentModel ?? UNKNOWN_MODEL_LABEL} unavailable]`;
+  }
+  return "";
+}
+
+/**
  * Launch a subagent: creates the multiplexer pane, builds the command, and
  * sends it. Returns a RunningSubagent — does NOT poll.
  *
@@ -1167,17 +1359,16 @@ function startWidgetRefresh() {
  */
 async function launchSubagent(
   params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  ctx: ExtensionContext,
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
+  const effectiveModel = resolveModelForSpawn(params, agentDefs, ctx);
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
-  const effectiveThinking = agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
@@ -1257,8 +1448,8 @@ async function launchSubagent(
       cmdParts.push("--plugin-dir", shellEscape(pluginDir));
     }
 
-    if (effectiveModel) {
-      cmdParts.push("--model", shellEscape(effectiveModel));
+    if (effectiveModel.command) {
+      cmdParts.push("--model", shellEscape(effectiveModel.command));
     }
 
     const sp = agentDefs.body;
@@ -1341,8 +1532,8 @@ async function launchSubagent(
   const loadout: SubagentLoadout = {
     agent: params.agent ?? null,
     toolAllowlist,
-    model: effectiveModel ?? null,
-    thinking: effectiveThinking ?? null,
+    model: effectiveModel.token,
+    thinking: effectiveModel.thinking,
     systemPromptMode: systemPromptMode ?? null,
     identity: identityInSystemPrompt ? identity : null,
     spawnable: agentDefs?.subagentAgents ?? null,
@@ -1354,7 +1545,12 @@ async function launchSubagent(
 
   // Apply model, identity, and the default-deny tool/extension restriction via
   // the shared helper (same code path resume uses — they can't drift).
-  applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
+  applySandboxToParts(parts, loadout, {
+    artifactDir,
+    name: params.name,
+    model: effectiveModel.command,
+    thinking: effectiveModel.thinking,
+  });
 
   // Build env prefix: subagent identity + config dir propagation + spawn allowlist
   const envParts: string[] = [];
@@ -1963,7 +2159,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "Project-local agents override global ones with the same name.",
       parameters: Type.Object({}),
 
-      async execute() {
+      async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
         const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
 
         if (list.length === 0) {
@@ -1973,16 +2169,52 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        const lines = list.map((a) => {
+        // Show the model each agent will actually run on, not the raw
+        // frontmatter value, so a config override or an unavailable model is
+        // visible before anything is spawned.
+        const config = loadSubagentConfig();
+        const catalog = buildModelCatalog(ctx);
+        const agents = list.map((agent) => {
+          const resolved = resolveSubagentModel({
+            param: null,
+            agentName: agent.name,
+            agentModel: agent.model ?? null,
+            agentThinking: agent.thinking ?? null,
+            config,
+            catalog,
+          });
+          const modelTag = formatAgentModelTag(resolved, agent.model ?? null);
+          return {
+            ...agent,
+            effectiveModel: resolved.command,
+            modelSource: resolved.source,
+            modelInherited: resolved.inherited,
+            modelProblem: resolved.warning ?? resolved.error ?? null,
+            modelTag,
+          };
+        });
+
+        const lines = agents.map((a) => {
           const badge = a.source === "project" ? " (project)" : "";
           const desc = a.description ? ` — ${a.description}` : "";
-          const model = a.model ? ` [${a.model}]` : "";
-          return `• ${a.name}${badge}${model}${desc}`;
+          return `• ${a.name}${badge}${a.modelTag}${desc}`;
         });
+
+        // A hand-edited config can name an agent that does not exist. Say so
+        // here instead of ignoring the entry silently.
+        const unknownConfiguredNames = unknownConfiguredAgentNames(
+          config,
+          list.map((agent) => agent.name),
+        );
+        if (unknownConfiguredNames.length > 0) {
+          lines.push(
+            `Warning: models.agents names with no matching agent: ${unknownConfiguredNames.join(", ")}`,
+          );
+        }
 
         return {
           content: [{ type: "text", text: lines.join("\n") }],
-          details: { agents: list },
+          details: { agents },
         };
       },
 
@@ -1995,7 +2227,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const lines = agents.map((a: any) => {
           const badge = a.source === "project" ? theme.fg("accent", " (project)") : "";
           const desc = a.description ? theme.fg("dim", ` — ${a.description}`) : "";
-          const model = a.model ? theme.fg("dim", ` [${a.model}]`) : "";
+          const model = a.modelTag ? theme.fg("dim", a.modelTag) : "";
           return `  ${theme.fg("toolTitle", theme.bold(a.name))}${badge}${model}${desc}`;
         });
         return new Text(lines.join("\n"), 0, 0);
@@ -2149,6 +2381,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // transcript doesn't block the UI.
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
+        // Re-resolve the model from the snapshot before creating a pane. An
+        // inherit token follows the session that is resuming; a literal model
+        // is re-checked against this installation. Refuse before we open a pane
+        // so a failure cannot leave an empty surface behind.
+        const resumeModel = resolveLoadoutModel({
+          loadout,
+          config: loadSubagentConfig(),
+          catalog: buildModelCatalog(ctx),
+        });
+        if (resumeModel.error) {
+          const err = `Cannot resume "${requestedName}": ${resumeModel.error}`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+        if (resumeModel.warning) ctx.ui.notify(resumeModel.warning, "warning");
+
         const surface = createSurface(name);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
@@ -2165,7 +2412,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         mkdirSync(dirname(activityFile), { recursive: true });
 
         // Replay the model, identity, and default-deny tool/extension sandbox.
-        applySandboxToParts(parts, loadout, { artifactDir, name });
+        applySandboxToParts(parts, loadout, {
+          artifactDir,
+          name,
+          model: resumeModel.command,
+          thinking: resumeModel.thinking,
+        });
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
@@ -2318,6 +2570,95 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
       },
     });
+
+  // /subagent-model command — pick which model an agent runs on
+  pi.registerCommand("subagent-model", {
+    description: "Choose which model a sub-agent runs on (writes the subagent config)",
+    handler: async (_args, ctx) => {
+      const registry = ctx.modelRegistry;
+      if (!registry?.getAvailable) {
+        ctx.ui.notify("This pi build does not expose the model registry.", "error");
+        return;
+      }
+
+      const allLabel = "all agents (config default)";
+      const agentNames = discoverAgentDefinitions()
+        .filter((agent) => !agent.disableModelInvocation)
+        .map((agent) => agent.name)
+        .sort();
+
+      const target = await ctx.ui.select("Set the sub-agent model for:", [allLabel, ...agentNames]);
+      if (!target) return;
+
+      const agentName = target === allLabel ? null : target;
+      const config = loadSubagentConfig();
+      const configuredEntry = agentName ? config.models?.agents[agentName] : undefined;
+      const currentValue = configuredEntry?.model ?? config.models?.default ?? null;
+
+      const items = buildModelPickerItems({
+        models: collectPickableModels(ctx),
+        currentValue,
+        leadingItems: [
+          {
+            value: INHERIT_TOKEN,
+            label: "inherit — follow this session's model",
+            searchText: "inherit follow this session model",
+          },
+          {
+            value: RESET_MODEL_CHOICE,
+            label: "reset to the agent's own model",
+            searchText: "reset to the agent own model",
+          },
+        ],
+      });
+
+      const choice = await pickModelChoice(ctx, `${target} — model`, items);
+      if (!choice) return;
+
+      const value = choice === RESET_MODEL_CHOICE ? null : choice;
+      const catalog = buildModelCatalog(ctx);
+      const levels = supportedThinkingForToken(
+        choice === RESET_MODEL_CHOICE ? currentValue : choice,
+        catalog,
+      );
+      const nonReasoning = levels.length === 1 && levels[0] === "off";
+      const currentThinking = configuredEntry?.thinking ?? config.models?.thinking ?? null;
+      const thinkingItems = buildThinkingItems(levels, currentThinking);
+      const thinkingTitle = nonReasoning
+        ? `${target} — thinking (this model does not support thinking levels, only "off")`
+        : `${target} — thinking`;
+
+      const thinkingChoice = await pickModelChoice(ctx, thinkingTitle, thinkingItems);
+      if (!thinkingChoice) return;
+
+      const thinking: ThinkingLevelName | null | undefined =
+        thinkingChoice === LEAVE_THINKING_CHOICE
+          ? undefined
+          : thinkingChoice === RESET_THINKING_CHOICE
+            ? null
+            : (thinkingChoice as ThinkingLevelName);
+
+      try {
+        const { path, changed } = writeModelSelection({ agentName, model: value, thinking });
+        if (!changed) {
+          ctx.ui.notify(`Nothing to clear for ${target} — no override is set.`, "info");
+          return;
+        }
+        const modelLabel = value === null ? "the agent default" : value;
+        const thinkingLabel =
+          thinking === undefined
+            ? currentThinking ?? "unchanged"
+            : thinking ?? "inherited/default";
+        ctx.ui.notify(
+          `Set ${target}: model ${modelLabel}, thinking ${thinkingLabel}. Written to ${path}.`,
+          "info",
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`Could not update the sub-agent config: ${message}`, "error");
+      }
+    },
+  });
 
   // /subagent command — spawn a subagent by name
   pi.registerCommand("subagent", {
