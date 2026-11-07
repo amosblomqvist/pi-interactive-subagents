@@ -2,11 +2,15 @@
 
 Async subagents for [Pi](https://github.com/earendil-works/pi). Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
-Each sub-agent runs in an isolated background process controlled through Pi's RPC protocol. The parent terminal stays responsive while the widget, messaging, sandbox, session resume, and automatic result delivery continue in the main session.
+Each Pi child runs as a separate interactive TUI process, not an RPC child.
+The Herdr backend creates one native pane per child. The Linux process backend uses a PTY for headless tests.
+A private mailbox carries coordinator messages separately from terminal input. Tool restrictions are not an OS sandbox.
 
 ## How it works
 
-`subagent()` returns immediately. The child runs in the background, with output captured beside its launch script. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` waits for startup and the bootstrap acknowledgment, then returns without waiting for task completion.
+The process backend captures output beside the launch script. The Herdr backend displays the actual Pi TUI.
+A live widget tracks running children. Completion notifications return results to the parent and trigger a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -27,6 +31,7 @@ The launch counter tracks **process launches, including resumes**, not tokens, d
 | `subagent` | Spawn a sub-agent in an isolated background process (async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
 | `subagent_cancel` | Cancel an exact running name owned by this session; preserve files and deliver a cancelled result |
+| `subagent_status` | Read owned worker identity and running, finished, or unknown status, with a validated terminal result when available |
 | `subagents_list` | List available agent definitions and their effective capabilities |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
 
@@ -49,7 +54,7 @@ processes. Failure to terminate a live surface is reported rather than silently 
 
 Offline regressions cover child-draining, reason display, late settled events after shutdown,
 exact-name cancellation, and a real detached descendant with an unaffected sibling. Native
-process cancellation was exercised on Windows; the POSIX path still needs native validation.
+process cancellation was historically exercised on Windows. Current Linux tests cover PTY descendants and cancellation of one Herdr child without stopping its sibling.
 These tests do not reproduce or cure provider-side long generation or compaction failures.
 Custom profiles can still grant nested delegation; the separate `agent-config` harness now
 keeps delegation in the parent by default, so its worker no longer creates hidden descendants.
@@ -92,7 +97,7 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 | `agent` | string | required | Which agent to spawn (must be known and permitted) |
 | `task` | string | required | Task prompt |
 | `name` | string | agent name | Display name for the process and widget. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …) |
-| `model` | string | agent's model | Override the model for this spawn. Worker requests for Astra are treated as reserved escalation. |
+| `model` | string | agent's model, then parent model | Override the model for this spawn. Worker requests for Astra are treated as reserved escalation. |
 | `useAstraXhigh` | boolean | `false` | Worker-only reserved escalation to Astra at `xhigh`; every activation asks the user and no-UI sessions are refused |
 | `cwd` | string | agent's `cwd` | Working directory (see [Role folders](#role-folders)) |
 
@@ -104,12 +109,33 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 subagent_message({ name: "scout", message: "Also check the auth middleware" });
 ```
 
-- **Running** — the message is sent to the background process over RPC (newlines flattened) and picked up at the next turn boundary. The call returns immediately; the eventual completion still arrives as a steer message.
-- **Finished** — the session is resumed with the message as the follow-up task, like a fresh spawn: fire-and-forget, always autonomous, result steered back later. The resumed run reclaims its original name.
+- **Running** — the private mailbox preserves literal multiline messages. An acknowledgment confirms submission to Pi, not model execution or completion.
+- **Finished** — the follow-up starts a new interactive process with the saved session and original name. The result arrives later.
+
+For repository-bound continuation, use the restrictive options:
+
+```typescript
+subagent_message({
+  name: "project-worker",
+  message: "Continue the agreed task",
+  resume_only: true,
+  expected_cwd: "/absolute/canonical/repository",
+  expected_agent: "project-worker",
+});
+```
+
+`resume_only` refuses a running worker without sending a message. The expected root and profile must match the saved loadout.
+`subagent_status({ name })` resolves only workers registered to the current parent session.
+A running process or pending resume takes precedence over an earlier result receipt.
+Finished status requires a validated `<session>.result.json` receipt. Missing or invalid evidence returns unknown status.
+Results are bounded to 48,000 characters plus a truncation marker.
+The runtime emits `interactive-subagents:disposed` only after successful cleanup of its pending launches and owned surfaces.
 
 Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.
 
-**Resume replays the original sandbox.** At spawn time the fully-resolved loadout — tool allowlist, backing extensions, model, thinking level, system prompt, spawn whitelist, cwd — is snapshotted to `<session>.loadout.json`. Resume rebuilds the exact same restricted process from that snapshot rather than relaunching unrestricted.
+**Resume replays the original restricted loadout.** Each launch saves its resolved policy to `<session>.loadout.json`.
+The snapshot includes tools, extensions, model, thinking level, prompt, spawn targets, and working directory.
+Resume reconstructs those restrictions instead of launching an unrestricted process.
 
 ### ask_question
 
@@ -133,7 +159,10 @@ All three are autonomous (`auto-exit: true`) and carry their identity in the sys
 
 ## Custom agents
 
-Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global). Discovery priority: **project > global > package-bundled** — a project-local file overrides a bundled agent with the same name.
+Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global).
+Default discovery priority is **project > global > package-bundled**.
+`allowProjectAgents: false` and `includeBundledAgents: false` disable those sources.
+The installed `agent-config` policy requires named personal profiles and disables both sources.
 
 ```markdown
 ---
@@ -159,7 +188,11 @@ You are a specialized agent that does X...
 | `thinking` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` |
 | `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child; if a declared extension is unavailable, spawning fails with a diagnostic instead of silently granting an incomplete loadout |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
-| `skills` | string | Comma-separated skill names to auto-load |
+| `skills` | string or boolean | Comma-separated skill names to load, or `false` to disable skill discovery |
+| `extensions` | boolean | `false` disables optional extension discovery |
+| `allowed_subagents` | string | `none` disables nested delegation |
+| `prompt_mode` | string | `append` or `replace`, compatible with the managed harness profiles |
+| `max_turns` | positive integer | Stop incomplete work at this turn limit. A resumed process receives a new budget |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
 | `system-prompt` | string | `append` or `replace`: pass the body as the child's `--append-system-prompt` / `--system-prompt`. Omit and the body is prepended to the task prompt instead |
 | `auto-exit` | boolean | Auto-shutdown when the agent finishes (see below) |
@@ -176,7 +209,9 @@ You are a specialized agent that does X...
 
 ### auto-exit
 
-With `auto-exit: true`, the session shuts down when the agent's turn ends — the agent just writes its final message and stops (there is no "done" tool). The last assistant message becomes the summary returned to the parent. Recommended for all autonomous agents.
+With `auto-exit: true`, the session shuts down after Pi reports settled work and pending child dependencies finish.
+The agent writes its final message and stops. There is no "done" tool.
+The last assistant message becomes the summary returned to the parent. Direct user interaction can keep the TUI open.
 
 Notes:
 
@@ -201,7 +236,7 @@ Extensions can register additional tools for sub-agents at runtime via `register
 
 ## Role folders
 
-`cwd` starts a sub-agent in a directory with its own config, so role-specific setups (CLAUDE.md, skills, extensions) apply:
+With project profiles enabled, `cwd` can select a directory with role-specific configuration:
 
 ```
 project/
@@ -216,27 +251,52 @@ subagent({ agent: "worker", cwd: "agents/sre", task: "Review the deployment pipe
 
 Set a per-agent default with `cwd:` in frontmatter.
 
+When `allowProjectAgents` is false, `cwd` changes only the working directory.
+It cannot replace personal configuration or move session storage into the project.
+Resume rejects a saved non-personal agent directory under this policy.
+
 ## Status widget & configuration
 
 The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (open for input or another stage), `stalled` (no valid snapshot for too long), or `running` (fallback). Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
 
 Use `/subagents` or `Ctrl+Alt+S` to open a live monitor. It shows the active descendant tree across the whole root lineage, with stable IDs, nesting depth, per-parent active child counts (`↳N`), task, model, current tool, sanitized action, and bounded observable events. Use arrow keys to select and collapse/expand branches. Counts remain visible whenever descendants are active, not only while an agent is waiting. Use `/subagent-log <name>` to inspect recent events for a directly owned running or completed named session. These views do not add monitoring output to the parent model's context. Thinking blocks are deliberately excluded.
 
+### Historical snapshot viewer
+
+The optional snapshot viewer is separate from the native Herdr execution backend.
+It displays snapshots, not an interactive child. The installed harness disables this viewer.
+
 In Pi's fullscreen mode, clicking a descendant widget row opens or focuses one Herdr tab for that stable descendant ID when `HERDR_ENV=1` and the viewer is enabled. The tab is explicitly scoped to `HERDR_WORKSPACE_ID`, preserves the caller's working directory, and runs only `viewer-runtime.mjs` against a bounded sanitized snapshot; it never starts or attaches a second Pi process, sends input, invokes a model, exposes hidden reasoning, or browses arbitrary sessions. Completed, failed, and cancelled owners write a terminal snapshot; an owner that disappears without doing so ages into a visible stale/disconnected state. Concurrent clicks are idempotent, and retired Pi sessions cannot perform a late run/focus. If Herdr is absent or the viewer is disabled, the same click falls back to Pi's bounded ownership-aware snapshot overlay; regular terminal mode keeps `/subagents` and `Ctrl+Alt+S` because Pi 0.85.1 routes widget mouse input only in fullscreen mode. Herdr failures are reported without affecting subagent execution.
 
 On Windows, shell quoting is fail-closed and `PI_SUBAGENT_HERDR_SHELL` is required. Set it to `powershell` or `git-bash` to describe the shell Herdr is configured to use for **new tabs**. The caller's inherited `SHELL` is not authoritative and is never inferred because it may differ from that new-tab shell; `cmd.exe` is unsupported because `%VAR%` expansion cannot safely preserve arbitrary paths. Shell selection, the absolute `process.execPath`, and every quoted path are validated before `tab create`, so missing or invalid configuration creates no tab. A successful `pane run` only confirms command-text submission, not that Node started or the viewer became ready; diagnose runtime failures by reading the test-owned pane during the coordinated manual smoke. The viewer never falls back silently to a bare `node` resolved by the pane shell.
 
-Configure status, delegation, and the viewer with an external JSON file and set `PI_SUBAGENTS_CONFIG` to its **absolute path**. This avoids modifying a sealed/installed package. `config.json.example` is an immutable packaged defaults example; a package-local `config.json` remains a compatibility fallback for source checkouts:
+### Native Herdr backend and personal policy
+
+Herdr launches Pi directly in a core-owned PTY, without tmux, `script`, an RPC child, or a transcript viewer.
+The target comes from the caller's Herdr terminal or an explicit existing `PI_SUBAGENT_HERDR_TAB`.
+There is no fallback to the focused pane. Startup waits for the child TUI and pane adoption before submitting the task.
+Cancellation and cleanup operate only on owned surfaces.
+
+Configuration precedence is an absolute `PI_SUBAGENTS_CONFIG` path, personal `subagents.json`, then package defaults.
+The personal file lives under `PI_CODING_AGENT_DIR`, or `~/.pi/agent` when that variable is absent.
+An invalid explicit configuration fails instead of falling back.
+Do not edit sealed packages. `config.json.example` provides packaged defaults, with package-local `config.json` retained for compatibility.
+
+The installed harness uses this policy:
 
 ```json
 {
   "status": { "enabled": true },
   "delegation": {
-    "maxDepth": 2,
-    "maxConcurrentDescendants": 4,
+    "maxDepth": 1,
+    "maxConcurrentDescendants": 6,
     "maxLaunchesPerLineage": null
   },
-  "herdrViewer": { "enabled": true }
+  "herdrViewer": { "enabled": false },
+  "surfaceBackend": "herdr",
+  "includeBundledAgents": false,
+  "allowProjectAgents": false,
+  "requireProfile": true
 }
 ```
 
@@ -244,7 +304,9 @@ Configure status, delegation, and the viewer with an external JSON file and set 
 
 ## Compatibility and verification
 
-This package targets `@earendil-works/pi-coding-agent` and `pi-tui` 0.85.1 with `typebox` 1.3.7.
+Package dependency metadata remains pinned to Pi 0.85.1 and `typebox` 1.3.7.
+The current interactive transport and installed harness are verified on Linux with Pi 1.5.0 and Node 22.23.2.
+The legacy SDK smoke checks loading, not current cross-platform TUI behavior.
 The 0.85.0 `pi-server` packaging workaround is no longer required.
 
 ```bash
@@ -257,9 +319,29 @@ npm run test:smoke
 
 The integration command runs process-only coverage by default; live model tests remain opt-in. The smoke test loads every extension entry point through Pi's real extension loader and exercises `safe_bash` without invoking a model.
 
-### Opt-in live child-process integration
+### Current offline TUI and Herdr verification
 
-The seven live cases exercise structured result delivery, `ask_question` plus name-addressed reply, finished-session resume, startup failure, parallel delivery, agent/schema discovery, and cwd/session placement. The parent is a **synthetic in-process `ExtensionAPI` driver**; only the children are real Pi processes using JSONL RPC. This is not an E2E test of the parent Pi loader, parent RPC protocol, or TUI/UI. It needs neither Orca nor tmux.
+Set `PI_TEST_CLI` to the installed Pi `dist/cli.js` path for the real TUI fixtures:
+
+```sh
+PI_TEST_CLI=/absolute/path/to/pi-coding-agent/dist/cli.js \
+node --test --test-concurrency=1 \
+  test/integration/interactive-tui.test.ts \
+  test/integration/project-session-contract.test.ts
+```
+
+These tests use synthetic providers and isolated configuration, without account credentials or paid model calls.
+They cover multiline delivery, owned results, restrictive resume, pending-resume status, and disposal.
+See [interactive transport](test/interactive-transport.md) and [native Herdr panels](test/herdr-panels.md) for prerequisites and commands.
+The Herdr test needs explicit desktop-control authorization. Process-only tests do not certify visible panels.
+Current Windows TUI behavior and live-provider execution remain unverified.
+
+### Historical live child-process verification
+
+The retained live suite covers result delivery, questions, resume, startup failure, parallel delivery, discovery, and session placement.
+Its parent is a synthetic in-process `ExtensionAPI` driver.
+The historical Windows verification used RPC children, before the interactive transport migration.
+It is historical evidence, not certification of the current TUI transport or parent UI.
 
 Each test creates a private temporary `PI_CODING_AGENT_DIR` and a separate synthetic parent session directory. Child sessions use Pi's normal cwd-keyed storage beneath that temporary config. The harness never discovers or copies credentials or models from the active home. To opt in, the executor may select only these concrete files:
 
@@ -298,10 +380,17 @@ Extensions may register their own backing file through `globalThis.__pi_interact
 
 ## Requirements
 
-- [Pi 0.85.1](https://github.com/earendil-works/pi)
-- A compatible Bash executable for generated launch scripts
+- [Pi 1.5.0](https://github.com/earendil-works/pi) for the verified interactive transport
+- Node 22.23.2 and a compatible Bash executable
+- Herdr app and core (`hc`) for native panes
+- Linux util-linux `script` for the process-PTY fallback
 
-On Windows, Git Bash is detected automatically and is the recommended option. Pi itself may be started from Orca's terminal, PowerShell, Command Prompt, Git Bash, or another terminal; the extension launches the child Bash executable independently. Other compatible Bash distributions can be used by setting `PI_SUBAGENT_BASH` to the full executable path.
+`PI_SUBAGENT_SURFACE_BACKEND=process` selects the fallback explicitly for isolated tests.
+It overrides the configured backend without changing personal configuration.
+
+The historical Windows launcher detects Git Bash automatically.
+`PI_SUBAGENT_BASH` can select another compatible Bash executable by its full path.
+This setting does not establish Windows support for the current TUI transport.
 
 ```powershell
 $env:PI_SUBAGENT_BASH = "C:\Program Files\Git\bin\bash.exe"
