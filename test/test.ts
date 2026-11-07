@@ -2557,8 +2557,8 @@ describe("tool registration", () => {
     const props = messageTool.parameters.properties;
     assert.deepEqual(
       Object.keys(props).sort(),
-      ["message", "name"],
-      "only name/message should remain (sessionId dropped)",
+      ["expected_agent", "expected_cwd", "message", "name", "resume_only"],
+      "name-only addressing plus optional restrictive resume guards",
     );
     assert.equal(props.message.type, "string");
     assert.equal(props.name.type, "string");

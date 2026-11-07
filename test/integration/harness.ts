@@ -267,6 +267,7 @@ type ExtensionDriver = {
   ctx: any;
   tool(name: string): any;
   sentMessages: SentMessage[];
+  emittedEvents: Array<{ name: string; data: unknown }>;
   waitForMessage(
     predicate: (entry: SentMessage) => boolean,
     options?: { from?: number; timeout?: number },
@@ -315,6 +316,7 @@ export async function createExtensionDriver(env: TestEnv): Promise<ExtensionDriv
   const registeredTools: any[] = [];
   const eventHandlers = new Map<string, Array<(event: any, ctx: any) => any>>();
   const sentMessages: SentMessage[] = [];
+  const emittedEvents: Array<{ name: string; data: unknown }> = [];
   const messageWaiters = new Set<() => void>();
   const ui = {
     setWidget() {},
@@ -323,6 +325,7 @@ export async function createExtensionDriver(env: TestEnv): Promise<ExtensionDriv
   };
   const ctx = {
     cwd: env.dir,
+    thinkingLevel: "off",
     mode: "rpc",
     hasUI: false,
     ui,
@@ -333,6 +336,8 @@ export async function createExtensionDriver(env: TestEnv): Promise<ExtensionDriv
     },
   };
   const api = {
+    getThinkingLevel: () => ctx.thinkingLevel,
+    events: { emit(name: string, data: unknown) { emittedEvents.push({ name, data }); } },
     on(name: string, handler: (event: any, ctx: any) => any) {
       const handlers = eventHandlers.get(name) ?? [];
       handlers.push(handler);
@@ -387,6 +392,7 @@ export async function createExtensionDriver(env: TestEnv): Promise<ExtensionDriv
     env,
     ctx,
     sentMessages,
+    emittedEvents,
     tool(name: string) {
       const found = registeredTools.find((tool) => tool.name === name);
       if (!found) throw new Error(`Extension tool not registered: ${name}`);

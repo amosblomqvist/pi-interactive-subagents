@@ -5,6 +5,7 @@ import { Box, Text, matchesKey, truncateToWidth, visibleWidth, type TuiMouseEven
 import { dirname, isAbsolute, join, resolve, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  realpathSync,
   readdirSync,
   readFileSync,
   writeFileSync,
@@ -88,6 +89,7 @@ import {
   touchLineageLaunch,
 } from "./lineage.ts";
 import { loadRuntimeConfig } from "./runtime-config.ts";
+import { clearTerminalReceipt, readTerminalReceipt, validateResumeConstraints, writeTerminalReceipt, type ChildStatus } from "./project-session-contract.ts";
 import { HerdrViewerManager, writeViewerSnapshot } from "./herdr-viewer.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
@@ -856,6 +858,7 @@ interface SubagentResult {
  * State for a launched (but not yet completed) subagent.
  */
 interface RunningSubagent {
+  resultEntryOffset?: number;
   id: string;
   parentId: string | null;
   depth: number;
@@ -894,6 +897,10 @@ interface RunningSubagent {
 
 /** Directly owned running subagents, keyed by stable descendant id. */
 const runningSubagents = new Map<string, RunningSubagent>();
+const pendingResumes = new Set<string>();
+const pendingLaunches = new Set<Promise<unknown>>();
+const pendingWatchers = new Set<Promise<unknown>>();
+const lineageReleaseErrors: Error[] = [];
 const lineageStatusStates = new Map<string, SubagentStatusState>();
 type LineageLaunchUsage = { used: number; limit: number | null };
 let latestLineageUsage: LineageLaunchUsage | null = null;
@@ -2098,9 +2105,16 @@ function startWidgetRefresh() {
  * Launch a subagent in a background child process. Returns a RunningSubagent
  * immediately; call watchSubagent() on it to observe completion.
  */
-async function launchSubagent(
+function launchSubagent(...args: Parameters<typeof launchSubagentImpl>): Promise<RunningSubagent> {
+  const promise = launchSubagentImpl(...args);
+  pendingLaunches.add(promise);
+  void promise.finally(() => pendingLaunches.delete(promise)).catch(() => {});
+  return promise;
+}
+
+async function launchSubagentImpl(
   params: Static<typeof SubagentParams> & { name: string },
-  ctx: { sessionManager: { getSessionFile(): string | null | undefined; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  ctx: { sessionManager: { getSessionFile(): string | null | undefined; getSessionId(): string; getSessionDir(): string }; cwd: string; model?: { provider: string; id: string } },
   options?: { surface?: string; model?: string; thinking?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
@@ -2109,10 +2123,10 @@ async function launchSubagent(
   if (runtimeConfig.requireProfile && !params.agent) throw new Error("A subagent profile is required");
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   if (params.agent && !agentDefs) throw new Error(`Unknown subagent profile: ${params.agent}`);
-  const effectiveModel = options?.model ?? params.model ?? agentDefs?.model;
+  const effectiveModel = options?.model ?? params.model ?? agentDefs?.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
-  const effectiveThinking = options?.thinking ?? agentDefs?.thinking;
+  const effectiveThinking = options?.thinking ?? agentDefs?.thinking ?? (!agentDefs?.model && !options?.model && !params.model ? latestPi?.getThinkingLevel?.() : undefined);
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
   const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
   const toolAllowlist = buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
@@ -2128,7 +2142,7 @@ async function launchSubagent(
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
   const { effectiveCwd, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
-  const targetCwdForSession = effectiveCwd ?? ctx.cwd;
+  const targetCwdForSession = realpathSync(effectiveCwd ?? ctx.cwd);
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
   // Generate a deterministic session file path for this subagent.
@@ -2316,7 +2330,7 @@ async function launchSubagent(
     identity: identityInSystemPrompt ? identity : null,
     spawnable: agentDefs?.subagentAgents ?? null,
     autoExit: agentDefs?.autoExit ?? false,
-    cwd: effectiveCwd ?? null,
+    cwd: targetCwdForSession,
     agentDir: resolvedAgentDir,
   };
 
@@ -2539,11 +2553,22 @@ function reportLineageHeartbeatFailure(running: RunningSubagent, error: unknown)
   }
 }
 
-async function watchSubagent(
+function watchSubagent(running: RunningSubagent, signal: AbortSignal): Promise<SubagentResult> {
+  const promise = watchSubagentImpl(running, signal);
+  pendingWatchers.add(promise);
+  void promise.finally(() => pendingWatchers.delete(promise)).catch(() => {});
+  return promise;
+}
+
+async function watchSubagentImpl(
   running: RunningSubagent,
   signal: AbortSignal,
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
+  const persistReceipt = (summary: string, exitCode: number) => {
+    const loadout = readSubagentLoadout(sessionFile);
+    writeTerminalReceipt({ id: running.id, name, agent: loadout?.agent ?? running.agent ?? null, cwd: loadout?.cwd ?? null, sessionFile, status: "finished", result: summary, exitCode });
+  };
   let releaseLineageLease = true;
   const closeForWatcher = () => {
     const outcome = closeSurfaceForLineage(surface);
@@ -2626,6 +2651,7 @@ async function watchSubagent(
       }
 
       closeForWatcher();
+      persistReceipt(summary, result.exitCode);
       runningSubagents.delete(running.id);
 
       return {
@@ -2642,7 +2668,7 @@ async function watchSubagent(
     // Pi subagent result extraction
     let summary: string;
     if (existsSync(sessionFile)) {
-      const allEntries = getNewEntries(sessionFile, 0);
+      const allEntries = getNewEntries(sessionFile, running.resultEntryOffset ?? 0);
       summary =
         findLastAssistantMessage(allEntries) ??
         (result.errorMessage
@@ -2662,6 +2688,7 @@ async function watchSubagent(
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
     closeForWatcher();
+    persistReceipt(summary, result.exitCode);
     runningSubagents.delete(running.id);
 
     return {
@@ -2690,7 +2717,11 @@ async function watchSubagent(
       !releaseLineageLease,
       releaseLineageLease,
     );
-    if (releaseLineageLease) runningSubagents.delete(running.id);
+    if (releaseLineageLease) {
+      try { persistReceipt(signal.aborted ? "Subagent cancelled." : `Subagent error: ${err?.message ?? String(err)}`, 1); }
+      catch (receiptError) { console.error("Failed to persist subagent terminal receipt", receiptError); }
+      runningSubagents.delete(running.id);
+    }
 
     if (signal.aborted) {
       return {
@@ -2726,7 +2757,12 @@ async function watchSubagent(
     // viewer-runtime once updatedAt stops advancing.
     persistTerminalSnapshot("disconnected");
     if (releaseLineageLease && running.lineageFile && running.lineageToken) {
-      await releaseLineageLaunch(running.lineageFile, running.id, running.lineageToken).catch(() => false);
+      try {
+        await releaseLineageLaunch(running.lineageFile, running.id, running.lineageToken);
+      } catch (error) {
+        lineageReleaseErrors.push(error instanceof Error ? error : new Error(String(error)));
+        throw error;
+      }
     }
     persistTerminalSnapshot("disconnected");
   }
@@ -2780,6 +2816,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
     if (moduleAbort) moduleAbort.abort();
 
+    await Promise.allSettled([...pendingLaunches]);
     const closeErrors: Error[] = [];
     const lineageReleases: Array<Promise<boolean>> = [];
     for (const [_id, agent] of runningSubagents) {
@@ -2801,7 +2838,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         lineageReleases.push(releaseLineageLaunch(agent.lineageFile, agent.id, agent.lineageToken));
       }
     }
-    await Promise.allSettled(lineageReleases);
+    const released = await Promise.allSettled(lineageReleases);
+    for (const result of released) {
+      if (result.status === "rejected") closeErrors.push(result.reason instanceof Error ? result.reason : new Error(String(result.reason)));
+    }
+    await Promise.allSettled([...pendingWatchers]);
+    closeErrors.push(...lineageReleaseErrors.splice(0));
     runningSubagents.clear();
     lineageStatusStates.clear();
     latestLineageFile = null;
@@ -2810,6 +2852,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (closeErrors.length > 0) {
       throw new AggregateError(closeErrors, "Failed to terminate running subagents during session shutdown");
     }
+    pi.events?.emit("interactive-subagents:disposed", { sessionId: _ctx.sessionManager.getSessionId(), reason: _event.reason });
   });
 
   // The spawning tools are always registered here. Whether a child process can
@@ -3266,6 +3309,26 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 
 
+  pi.registerTool({
+    name: "subagent_status",
+    label: "Subagent Status",
+    description: "Read one owned child's status by exact name. Only a terminal receipt means finished; result is capped at 48,000 characters.",
+    parameters: Type.Object({ name: Type.String() }),
+    async execute(_id, params, _signal, _update, ctx) {
+      const name = params.name.trim();
+      const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+      const entry = resolveNameInRegistry(artifactDir, name);
+      if (!entry) throw new Error(`No owned subagent named "${name}"`);
+      const loadout = readSubagentLoadout(entry.sessionFile);
+      const identity = { id: entry.subagentId ?? entry.sessionId ?? name, name, agent: loadout?.agent ?? null, cwd: loadout?.cwd ?? null, sessionFile: entry.sessionFile };
+      const running = runningSubagents.get(identity.id);
+      const details: ChildStatus = pendingResumes.has(resolve(entry.sessionFile)) || (running && running.name === name && running.sessionFile === entry.sessionFile)
+        ? { ...identity, status: "running" }
+        : readTerminalReceipt(identity) ?? { ...identity, status: "unknown" };
+      return { content: [{ type: "text", text: JSON.stringify(details) }], details };
+    },
+  });
+
   // ── subagent_message tool ──
   pi.registerTool({
       name: "subagent_message",
@@ -3284,6 +3347,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "Use it for a pending question or concrete follow-up, not routine approval. `name` and `message` are required. " +
         "Steering returns immediately; resuming delivers its result later as a steer message. Do not poll or fabricate results; inspect and integrate the delivered result.",
       parameters: Type.Object({
+        resume_only: Type.Optional(Type.Boolean()),
+        expected_cwd: Type.Optional(Type.String()),
+        expected_agent: Type.Optional(Type.String()),
         name: Type.String({
           description:
             "Exact display name of the subagent. Steers it if it is still running; resumes its session if it has finished.",
@@ -3344,6 +3410,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // A name that matches a currently-running subagent always steers it.
         const runningMatch = Array.from(runningSubagents.values()).find((r) => r.name === requestedName);
         if (runningMatch) {
+          if (params.resume_only) throw new Error(`Subagent "${requestedName}" is still running; resume_only forbids steering`);
+          if (params.expected_agent !== undefined || params.expected_cwd !== undefined) {
+            const saved = readSubagentLoadout(runningMatch.sessionFile);
+            if (!saved) throw new Error("Missing sandbox snapshot");
+            validateResumeConstraints(saved, params);
+          }
           return await handleSubagentSteer({ name: requestedName, message: params.message });
         }
 
@@ -3381,6 +3453,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // mutating the same .jsonl corrupts it. Steer it by name instead.
         for (const r of runningSubagents.values()) {
           if (resolve(r.sessionFile) === resolve(sessionPath)) {
+            if (params.resume_only) throw new Error(`Subagent "${requestedName}" is still running; resume_only forbids steering`);
             const err = `Subagent "${requestedName}" is still running as "${r.name}". Your message will steer it; resending as a steer.`;
             return await handleSubagentSteer({ name: r.name, message: params.message });
           }
@@ -3404,6 +3477,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
+        validateResumeConstraints(loadout, params);
+        if (pendingResumes.has(sessionPath)) throw new Error(`Subagent "${name}" is already resuming`);
+        pendingResumes.add(sessionPath);
+        let finishResume!: () => void;
+        const resumePending = new Promise<void>(resolve => { finishResume = resolve; });
+        pendingLaunches.add(resumePending);
+        const resumeGeneration = sessionGeneration;
+        try {
         if (isReservedWorkerLoadout(loadout)) {
           const confirmation = await confirmReservedWorkerEscalation(ctx, message);
           if (confirmation.approved === false) {
@@ -3442,6 +3523,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         });
         let surface: string;
         try {
+          if (!sessionActive || resumeGeneration !== sessionGeneration || Array.from(runningSubagents.values()).some(r => r.sessionFile === sessionPath)) throw new Error("Resume ownership changed before launch");
+          validateResumeConstraints(loadout, params);
+          clearTerminalReceipt(sessionPath);
           surface = createSurface(name, runtimeConfig);
         } catch (error) {
           await releaseLineageLaunch(lineageContext.file, id, lineageLease.token, { refundLaunch: true });
@@ -3559,6 +3643,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           depth: childDepth,
           name,
           task: message,
+          resultEntryOffset: entryCountBefore,
           agent: loadout.agent ?? undefined,
           model: loadout.model ?? undefined,
           thinking: loadout.thinking ?? undefined,
@@ -3652,6 +3737,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             capabilities: capabilityDetails(resumedCapabilities),
           },
         };
+        } finally {
+          pendingResumes.delete(sessionPath);
+          pendingLaunches.delete(resumePending);
+          finishResume();
+        }
       },
     });
 
