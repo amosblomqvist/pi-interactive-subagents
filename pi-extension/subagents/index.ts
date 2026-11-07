@@ -12,6 +12,7 @@ import {
   mkdirSync,
   copyFileSync,
   unlinkSync,
+  rmSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -19,6 +20,7 @@ import {
   getSurfaceProcessId,
   sendCommand,
   sendLongCommand,
+  waitSurfaceReady,
   pollForExit,
   closeSurface,
   shellEscape,
@@ -198,6 +200,9 @@ interface AgentDefaults {
   model?: string;
   tools?: string;
   skills?: string;
+  disableSkills?: boolean;
+  disableExtensions?: boolean;
+  maxTurns?: number;
   thinking?: string;
   /**
    * If set (non-empty), this agent is granted the full subagent spawning
@@ -400,8 +405,9 @@ function getBundledAgentsDir(): string {
 }
 
 function getFrontmatterValue(frontmatter: string, key: string): string | undefined {
-  const match = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
-  return match ? match[1].trim() : undefined;
+  const matches = [...frontmatter.matchAll(new RegExp(`^${key}:[ \\t]*(.*)$`, "gm"))];
+  if (matches.length > 1) throw new Error(`Duplicate frontmatter key: ${key}`);
+  return matches[0]?.[1].trim();
 }
 
 function parseOptionalBoolean(value: string | undefined): boolean | undefined {
@@ -428,22 +434,46 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
 
   const frontmatter = match[1];
   const body = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n*/, "").trim();
-  const systemPromptMode = getFrontmatterValue(frontmatter, "system-prompt");
+  const nativePrompt = getFrontmatterValue(frontmatter, "system-prompt");
+  const promptMode = getFrontmatterValue(frontmatter, "prompt_mode");
+  if (promptMode != null && promptMode !== "append" && promptMode !== "replace") throw new Error(`Invalid prompt_mode in ${fallbackName}`);
+  if (nativePrompt && promptMode && nativePrompt !== promptMode) throw new Error(`Conflicting prompt modes in ${fallbackName}`);
+  const systemPromptMode = promptMode ?? nativePrompt;
+  const skill = getFrontmatterValue(frontmatter, "skill");
+  const skills = getFrontmatterValue(frontmatter, "skills");
+  if (skill && skills && skill !== skills) throw new Error(`Conflicting skill declarations in ${fallbackName}`);
+  const effectiveSkills = skill ?? skills;
+  const extensions = getFrontmatterValue(frontmatter, "extensions");
+  if (extensions != null && extensions !== "false" && extensions !== "true") throw new Error(`Invalid extensions in ${fallbackName}`);
+  const allowed = getFrontmatterValue(frontmatter, "allowed_subagents");
+  if (allowed != null && allowed !== "none") throw new Error(`Unsupported allowed_subagents in ${fallbackName}`);
+  const declaredTools = getFrontmatterValue(frontmatter, "tools");
+  const requestedTools = parseCommaList(declaredTools) ?? [];
+  if (allowed === "none" && requestedTools.some(tool => (SPAWNING_TOOLS as readonly string[]).includes(tool))) throw new Error(`Conflicting spawning tools in ${fallbackName}`);
+  if (extensions === "false" && requestedTools.some(tool => !BUILTIN_TOOLS.has(tool) && !SUBAGENT_CONTROL_TOOL_SET.has(tool))) throw new Error(`extensions:false forbids extension-backed tools in ${fallbackName}`);
+  const spawnable = parseCommaList(getFrontmatterValue(frontmatter, "subagent_agents"));
+  if (allowed === "none" && spawnable?.length) throw new Error(`Conflicting subagent grants in ${fallbackName}`);
+  const rawTurns = getFrontmatterValue(frontmatter, "max_turns");
+  const maxTurns = rawTurns == null ? undefined : Number(rawTurns);
+  if (maxTurns !== undefined && (!/^\d+$/.test(rawTurns!) || !Number.isSafeInteger(maxTurns) || maxTurns <= 0)) throw new Error(`Invalid max_turns in ${fallbackName}`);
 
   return {
     name: getFrontmatterValue(frontmatter, "name") ?? fallbackName,
     description: getFrontmatterValue(frontmatter, "description"),
     model: getFrontmatterValue(frontmatter, "model"),
-    tools: getFrontmatterValue(frontmatter, "tools"),
+    tools: declaredTools ?? (allowed === "none" ? [...BUILTIN_TOOLS].join(",") : undefined),
     systemPromptMode:
       systemPromptMode === "replace"
         ? "replace"
         : systemPromptMode === "append"
           ? "append"
           : undefined,
-    skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
+    skills: effectiveSkills === "false" || effectiveSkills === "true" ? undefined : effectiveSkills,
+    disableSkills: effectiveSkills === "false",
+    disableExtensions: extensions === "false",
+    maxTurns,
     thinking: getFrontmatterValue(frontmatter, "thinking"),
-    subagentAgents: parseCommaList(getFrontmatterValue(frontmatter, "subagent_agents")),
+    subagentAgents: allowed === "none" ? [] : spawnable,
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
     interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
     sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
@@ -464,6 +494,8 @@ function discoverAgentDefinitions(applySubagentAllowlist = true): ListedAgentDef
   ];
 
   for (const { path: dir, source } of dirs) {
+    if (source === "package" && !runtimeConfig.includeBundledAgents) continue;
+    if (source === "project" && !runtimeConfig.allowProjectAgents) continue;
     if (!existsSync(dir)) continue;
     for (const file of readdirSync(dir).filter((entry) => entry.endsWith(".md"))) {
       const parsed = parseAgentDefinition(
@@ -496,7 +528,7 @@ function resolveSubagentPaths(
   const cwdIsFromAgent = !params.cwd && agentDefs?.cwd != null;
   const cwdBase = cwdIsFromAgent ? getAgentConfigDir() : process.cwd();
   const effectiveCwd = resolveRequestedCwd(rawCwd, cwdBase);
-  const localAgentDir = effectiveCwd ? join(effectiveCwd, ".pi", "agent") : null;
+  const localAgentDir = runtimeConfig.allowProjectAgents && effectiveCwd ? join(effectiveCwd, ".pi", "agent") : null;
   const effectiveAgentDir =
     localAgentDir && existsSync(localAgentDir) ? localAgentDir : getAgentConfigDir();
   return { effectiveCwd, localAgentDir, effectiveAgentDir };
@@ -724,8 +756,8 @@ async function bindLineageLaunchToSurface(
   token: string,
   surface: string,
 ): Promise<void> {
-  const ownerPid = getSurfaceProcessId(surface);
   try {
+    const ownerPid = getSurfaceProcessId(surface);
     if (!ownerPid || !(await setLineageLaunchOwner(context.file, id, token, ownerPid))) {
       throw new Error("The lineage launch lease disappeared before process ownership was recorded");
     }
@@ -1700,6 +1732,9 @@ function applySandboxToParts(
   loadout: SubagentLoadout,
   opts: { artifactDir: string; name: string },
 ): void {
+  parts.unshift(`PI_SUBAGENT_MAX_TURNS=${shellEscape(loadout.maxTurns == null ? "" : String(loadout.maxTurns))}`);
+  if (loadout.disableSkills) parts.push("--no-skills");
+  if (loadout.disableExtensions && !loadout.toolAllowlist) parts.push("--no-extensions");
   if (loadout.model) {
     const model = loadout.thinking ? `${loadout.model}:${loadout.thinking}` : loadout.model;
     parts.push("--model", shellEscape(model));
@@ -1755,14 +1790,14 @@ function buildPiPromptArgs(params: {
   ];
 }
 
-function buildRpcInput(messages: string[]): string {
-  return messages
-    .filter((message) => message.length > 0)
-    .map((message, index) => JSON.stringify({
-      type: index === 0 ? "prompt" : "follow_up",
-      message,
-    }))
-    .join("\n");
+function buildInteractiveMessages(prompts: string[]) {
+  const messages = prompts.filter(Boolean);
+  if (messages.length === 0) return [];
+  return [{
+    message: messages[messages.length - 1],
+    deliverAs: "followUp" as const,
+    skills: messages.slice(0, -1).map(message => message.replace(/^\/skill:/, "")),
+  }];
 }
 
 function activityLabel(activity: SubagentActivityState): string | undefined {
@@ -1863,17 +1898,15 @@ function resolveRunningByName(name: string):
 }
 
 /**
- * Send a follow-up message to a running subagent over RPC. Newlines are
- * collapsed to keep the follow-up as one turn.
+ * Send a literal follow-up message through the surface transport.
  */
-function steerSubagent(
+async function steerSubagent(
   running: RunningSubagent,
   message: string,
-  send: (surface: string, command: string) => void = sendCommand,
-): { ok: true } | { error: string } {
-  const flattened = message.replace(/\s*\n\s*/g, " ").trim();
+  send: (surface: string, command: string) => void | Promise<void> = sendCommand,
+): Promise<{ ok: true } | { error: string }> {
   try {
-    send(running.surface, flattened);
+    await send(running.surface, message);
     return { ok: true };
   } catch (error: any) {
     return {
@@ -1884,9 +1917,9 @@ function steerSubagent(
   }
 }
 
-function handleSubagentSteer(
+async function handleSubagentSteer(
   params: { name?: string; message?: string },
-  send: (surface: string, command: string) => void = sendCommand,
+  send: (surface: string, command: string) => void | Promise<void> = sendCommand,
 ) {
   const message = params.message?.trim();
   if (!message) {
@@ -1906,7 +1939,7 @@ function handleSubagentSteer(
   const now = Date.now();
   observeRunningSubagent(running, now);
 
-  const steer = steerSubagent(running, message, send);
+  const steer = await steerSubagent(running, message, send);
   if ("error" in steer) {
     return {
       content: [{ type: "text" as const, text: steer.error }],
@@ -1921,7 +1954,7 @@ function handleSubagentSteer(
     content: [{
       type: "text" as const,
       text:
-        `Message delivered to running subagent "${running.name}". It picks this up at its next ` +
+        `Message accepted by running subagent "${running.name}". It picks this up at its next ` +
         `turn boundary. If it exits, its result still arrives as a steer message.`,
     }],
     details: { id: running.id, name: running.name, status: "steered" },
@@ -2004,7 +2037,7 @@ export const __test__ = {
   buildSubagentToolAllowlist,
   applySandboxToParts,
   buildPiPromptArgs,
-  buildRpcInput,
+  buildInteractiveMessages,
   formatWidgetRightLabel,
   observeRunningSubagent,
   getToolExtensionPath,
@@ -2073,7 +2106,9 @@ async function launchSubagent(
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
+  if (runtimeConfig.requireProfile && !params.agent) throw new Error("A subagent profile is required");
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  if (params.agent && !agentDefs) throw new Error(`Unknown subagent profile: ${params.agent}`);
   const effectiveModel = options?.model ?? params.model ?? agentDefs?.model;
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
@@ -2092,7 +2127,7 @@ async function launchSubagent(
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
-  const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
+  const { effectiveCwd, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
@@ -2138,7 +2173,7 @@ async function launchSubagent(
   let surface: string;
   try {
     // A surface is an isolated background process with RPC input and log output.
-    surface = options?.surface ?? createSurface(params.name);
+    surface = options?.surface ?? createSurface(params.name, runtimeConfig);
   } catch (error) {
     await releaseLineageLaunch(lineageContext.file, id, lineageLease.token, { refundLaunch: true });
     throw error;
@@ -2255,18 +2290,11 @@ async function launchSubagent(
   // Build pi command
   const parts: string[] = ["pi"];
   parts.push("--session", shellEscape(subagentSessionFile));
-  parts.push("--mode", "rpc");
 
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
 
-  // Resolve the config dir the child sees: a target-local .pi/agent/ wins,
-  // else the propagated global dir. Captured once so the launch env and the
-  // resume snapshot agree.
-  const resolvedAgentDir =
-    localAgentDir && existsSync(localAgentDir)
-      ? localAgentDir
-      : process.env.PI_CODING_AGENT_DIR ?? null;
+  const resolvedAgentDir = effectiveAgentDir;
 
   // Default-deny model: when an agent restricts its tools (or is granted the
   // spawning toolset), we disable global extension discovery and re-enable only
@@ -2279,6 +2307,9 @@ async function launchSubagent(
   const loadout: SubagentLoadout = {
     agent: params.agent ?? null,
     toolAllowlist,
+    disableSkills: agentDefs?.disableSkills ?? false,
+    disableExtensions: agentDefs?.disableExtensions ?? false,
+    maxTurns: agentDefs?.maxTurns,
     model: effectiveModel ?? null,
     thinking: effectiveThinking ?? null,
     systemPromptMode: systemPromptMode ?? null,
@@ -2324,7 +2355,7 @@ async function launchSubagent(
   const envPrefix = envParts.join(" ") + " ";
 
   // Persist blank-session context for diagnostics while sending the expanded
-  // task over RPC as the initial user message.
+  // task through private IPC as the initial user message.
   if (launchBehavior.taskDelivery !== "direct") {
     try {
       const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
@@ -2350,7 +2381,7 @@ async function launchSubagent(
     taskDelivery: launchBehavior.taskDelivery,
     taskArg: fullTask,
   });
-  const initialInput = buildRpcInput(promptArgs);
+  const initialMessages = buildInteractiveMessages(promptArgs);
 
   // Resolve cwd — param overrides agent default, supports absolute and relative paths.
   // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
@@ -2374,8 +2405,9 @@ async function launchSubagent(
         `# Session: ${subagentSessionFile}`,
         `# Surface: ${surface}`,
       ].join("\n"),
-      initialInput,
+      interactive: { messages: initialMessages },
     });
+    await waitSurfaceReady(surface, { sessionFile: subagentSessionFile });
   } catch (error) {
     try { closeSurface(surface); } catch {}
     await releaseLineageLaunch(lineageContext.file, id, lineageLease.token, { refundLaunch: true });
@@ -3312,7 +3344,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // A name that matches a currently-running subagent always steers it.
         const runningMatch = Array.from(runningSubagents.values()).find((r) => r.name === requestedName);
         if (runningMatch) {
-          return handleSubagentSteer({ name: requestedName, message: params.message });
+          return await handleSubagentSteer({ name: requestedName, message: params.message });
         }
 
         // ── Resume a finished session by name ──
@@ -3350,7 +3382,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         for (const r of runningSubagents.values()) {
           if (resolve(r.sessionFile) === resolve(sessionPath)) {
             const err = `Subagent "${requestedName}" is still running as "${r.name}". Your message will steer it; resending as a steer.`;
-            return handleSubagentSteer({ name: r.name, message: params.message });
+            return await handleSubagentSteer({ name: r.name, message: params.message });
           }
         }
 
@@ -3364,6 +3396,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             `(it predates sandboxed resume, or its .loadout.json sidecar was removed). ` +
             `Resuming would relaunch with all global extensions and the full toolset, so this is refused. ` +
             `Re-run the task as a fresh subagent instead.`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
+        if (!runtimeConfig.allowProjectAgents && loadout.agentDir && resolve(loadout.agentDir) !== resolve(getAgentConfigDir())) {
+          const err = "Cannot resume a snapshot with a non-personal agent directory under the installed policy. Start a fresh subagent.";
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
@@ -3405,14 +3442,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         });
         let surface: string;
         try {
-          surface = createSurface(name);
+          surface = createSurface(name, runtimeConfig);
         } catch (error) {
           await releaseLineageLaunch(lineageContext.file, id, lineageLease.token, { refundLaunch: true });
           throw error;
         }
 
         // Build pi resume command
-        const parts = ["pi", "--session", shellEscape(sessionPath), "--mode", "rpc"];
+        const parts = ["pi", "--session", shellEscape(sessionPath)];
 
         // Load subagent-done extension so the agent can self-terminate if needed
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
@@ -3495,6 +3532,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
         );
         try {
+          rmSync(`${sessionPath}.exit`, { force: true });
           sendLongCommand(surface, command, {
             scriptPath: launchScriptFile,
             scriptPreamble: [
@@ -3504,8 +3542,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               `# Surface: ${surface}`,
               ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
             ].join("\n"),
-            initialInput: resumeMsgFile ? buildRpcInput([message]) : undefined,
+            interactive: { messages: resumeMsgFile ? [{ message, deliverAs: "followUp" }] : [] },
           });
+          await waitSurfaceReady(surface, { sessionFile: sessionPath });
         } catch (error) {
           try { closeSurface(surface); } catch {}
           await releaseLineageLaunch(lineageContext.file, id, lineageLease.token, { refundLaunch: true });

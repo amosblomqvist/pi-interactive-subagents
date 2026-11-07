@@ -1,5 +1,5 @@
 /**
- * Process-backed subagent surface with RPC input and file-backed output.
+ * Process-backed subagent surface with private IPC input and file-backed output.
  * It preserves asynchronous execution, steering, status tracking, and result
  * delivery regardless of which terminal hosts the parent Pi session.
  */
@@ -19,6 +19,10 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, win32 } from "node:path";
+import { createMailbox, publishMessage, closeMailbox, type InteractiveMessage } from "./interactive-ipc.ts";
+import { createHerdrSurface, launchHerdrSurface, herdrMetadata, closeHerdrSurface, waitHerdrAdoption, readHerdrScreen, type HerdrSurface } from "./herdr-surface.ts";
+
+import { loadRuntimeConfig, type RuntimeConfig } from "./runtime-config.ts";
 
 type BackgroundBashResolutionOptions = {
   platform?: NodeJS.Platform;
@@ -94,11 +98,15 @@ export function withExitSentinel(command: string): string {
 }
 
 type BackgroundSurface = {
+  herdr?: HerdrSurface;
   child?: ChildProcess;
   outputFile?: string;
   outputStream?: WriteStream;
   exitCode?: number;
   spawnError?: string;
+  mailbox?: string;
+  initialMessageIds?: string[];
+  pendingInitialMessages?: InteractiveMessage[];
 };
 
 const BACKGROUND_PREFIX = "process:";
@@ -110,7 +118,12 @@ export function isBackgroundSurface(surface: string): boolean {
 
 /** Return the process that owns the background surface, when it has spawned. */
 export function getSurfaceProcessId(surface: string): number | undefined {
-  return backgroundSurfaces.get(surface)?.child?.pid;
+  const state = backgroundSurfaces.get(surface);
+  return state?.herdr ? herdrMetadata(state.herdr, true).pid : state?.child?.pid;
+}
+
+export function getSurfaceTerminalAddress(surface: string): string | undefined {
+  return backgroundSurfaces.get(surface)?.herdr?.address;
 }
 
 export function createBackgroundSurface(): string {
@@ -119,14 +132,83 @@ export function createBackgroundSurface(): string {
   return surface;
 }
 
-export function createSurface(name: string): string {
-  void name;
-  return createBackgroundSurface();
+export function createSurface(name: string, config?: Pick<RuntimeConfig, "surfaceBackend">): string {
+  const backend = process.env.PI_SUBAGENT_SURFACE_BACKEND ?? (config ?? loadRuntimeConfig()).surfaceBackend;
+  if (backend !== "process" && backend !== "herdr") throw new Error(`Unknown subagent surface backend: ${backend}`);
+  const herdr = backend === "herdr" ? createHerdrSurface(name) : undefined;
+  const surface = createBackgroundSurface();
+  if (herdr) backgroundSurfaces.get(surface)!.herdr = herdr;
+  return surface;
 }
 
-/** Send a prompt to the child process through Pi's JSONL RPC input. */
-export function sendCommand(surface: string, command: string): void {
+async function waitForInteractiveFile(
+  surface: string,
+  file: string,
+  options: { timeoutMs?: number; sessionFile?: string },
+  timeoutMessage: string,
+): Promise<any> {
+  const deadline = Date.now() + (options.timeoutMs ?? 10_000);
+  for (;;) {
+    if (options.sessionFile) {
+      try {
+        const exit = JSON.parse(readFileSync(`${options.sessionFile}.exit`, "utf8"));
+        if (exit.type === "error") throw new Error(exit.errorMessage || "Subagent startup failed");
+      } catch (error: any) {
+        if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+      }
+    }
+    const state = backgroundSurfaces.get(surface);
+    if (state?.spawnError) throw new Error(state.spawnError);
+    const herdrClosed = state?.herdr && herdrMetadata(state.herdr).state === "finished";
+    if (!state?.mailbox) throw new Error("Interactive surface closed");
+    try { return JSON.parse(readFileSync(join(state.mailbox, file), "utf8")); }
+    catch (error: any) { if (error.code !== "ENOENT") throw error; }
+    if (herdrClosed) throw new Error("Interactive Herdr surface closed before confirmation");
+    if (state.exitCode !== undefined || state.child?.exitCode != null || state.child?.signalCode != null) {
+      throw new Error("Interactive surface closed before confirmation");
+    }
+    if (!existsSync(state.mailbox)) throw new Error("Interactive IPC disappeared before confirmation");
+    if (Date.now() >= deadline) throw new Error(timeoutMessage);
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
+
+export async function waitSurfaceReady(
+  surface: string,
+  options: { timeoutMs?: number; sessionFile?: string } = {},
+): Promise<void> {
+  const deadline = Date.now() + (options.timeoutMs ?? 15_000);
   const state = backgroundSurfaces.get(surface);
+  const herdr = state?.herdr;
+  const remaining = () => ({ ...options, timeoutMs: Math.max(0, deadline - Date.now()) });
+  const ready = await waitForInteractiveFile(surface, "ready", remaining(), "Interactive ready handshake timed out");
+  if (ready.mode !== "tui") throw new Error("Invalid interactive ready handshake");
+  if (herdr) {
+    await waitHerdrAdoption(herdr, deadline);
+    if (Date.now() >= deadline) throw new Error("Herdr readiness deadline exceeded before bootstrap delivery");
+    const pending = state.pendingInitialMessages ?? [];
+    state.pendingInitialMessages = undefined;
+    state.initialMessageIds ??= [];
+    // Fast auto-exit children must not start work before their native pane exists.
+    for (const message of pending) state.initialMessageIds.push(publishMessage(state.mailbox!, message));
+  }
+  for (const id of state?.initialMessageIds ?? []) {
+    const ack = await waitForInteractiveFile(surface, `${id}.ack`, herdr ? remaining() : options, `Bootstrap delivery ${id} uncertain: ACK deadline exceeded; no automatic retry`);
+    if (ack.id !== id || ack.status !== "accepted") throw new Error(`Bootstrap message rejected: ${ack.error || "invalid ACK"}`);
+  }
+}
+
+/** Resolve only when Pi accepts the message; generic surfaces retain JSONL input. */
+export async function sendCommand(surface: string, command: string, options: { timeoutMs?: number } = {}): Promise<void> {
+  const state = backgroundSurfaces.get(surface);
+  if (state?.mailbox) {
+    if (state.exitCode !== undefined || state.spawnError || (state.herdr && herdrMetadata(state.herdr).state === "finished")) throw new Error("Interactive subagent has closed");
+    const id = publishMessage(state.mailbox, { message: command, deliverAs: "steer" });
+    const ack = await waitForInteractiveFile(surface, `${id}.ack`, options, `Delivery ${id} uncertain: ACK deadline exceeded; no automatic retry`);
+    if (ack.id !== id) throw new Error(`Invalid ACK identity for ${id}`);
+    if (ack.status !== "accepted") throw new Error(`Message ${id} rejected: ${ack.error || "invalid ACK"}`);
+    return;
+  }
   const stdin = state?.child?.stdin;
   if (!state || !stdin || stdin.destroyed || !stdin.writable) {
     throw new Error("Background subagent input is not writable");
@@ -145,10 +227,15 @@ export function sendCommand(surface: string, command: string): void {
 export function sendLongCommand(
   surface: string,
   command: string,
-  options?: { scriptPath?: string; scriptPreamble?: string; initialInput?: string },
+  options?: { scriptPath?: string; scriptPreamble?: string; initialInput?: string; interactive?: { messages: InteractiveMessage[] } },
 ): string {
   const state = backgroundSurfaces.get(surface);
   if (!state) throw new Error(`Unknown background surface: ${surface}`);
+  if (options?.interactive && !state.herdr && process.platform !== "linux") {
+    throw new Error("Interactive Pi subagents require Linux util-linux script (PTY); no RPC fallback is available");
+  }
+  if (options?.interactive && options.initialInput) throw new Error("Interactive Pi input must use IPC, not stdin");
+  if (state.herdr && options?.initialInput) throw new Error("Herdr input must use interactive IPC, not stdin");
 
   const scriptPath =
     options?.scriptPath ??
@@ -176,9 +263,28 @@ export function sendLongCommand(
 
   const bash = resolveBackgroundBash();
   const outputFile = `${scriptPath}.log`;
-  const outputStream = createWriteStream(outputFile, { flags: "a" });
   const shellScriptPath = process.platform === "win32" ? scriptPath.replace(/\\/g, "/") : scriptPath;
-  const child = spawn(bash, [shellScriptPath], {
+  if (options?.interactive) {
+    state.mailbox = createMailbox(dirname(scriptPath));
+    try {
+      if (state.herdr) state.pendingInitialMessages = structuredClone(options.interactive.messages);
+      else state.initialMessageIds = options.interactive.messages.map(message => publishMessage(state.mailbox!, message));
+    } catch (error) { closeMailbox(state.mailbox); throw error; }
+  }
+  if (state.herdr) {
+    try { launchHerdrSurface(state.herdr, bash, shellScriptPath, state.mailbox); }
+    catch (error) {
+      if (state.mailbox) closeMailbox(state.mailbox);
+      state.spawnError = error instanceof Error ? error.message : "Herdr launch failed";
+      throw error;
+    }
+    return scriptPath;
+  }
+  const outputStream = createWriteStream(outputFile, { flags: "a" });
+  const child = spawn(options?.interactive ? "script" : bash, options?.interactive
+    ? ["-q", "-e", "-f", "-c", `${shellEscape(bash)} ${shellEscape(shellScriptPath)}`, "/dev/null"]
+    : [shellScriptPath], {
+    env: state.mailbox ? { ...process.env, PI_SUBAGENT_IPC_DIR: state.mailbox } : process.env,
     detached: process.platform !== "win32",
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
@@ -196,9 +302,11 @@ export function sendLongCommand(
     child.kill("SIGTERM");
   });
   child.once("error", (error) => {
-    state.spawnError = error.message;
+    state.spawnError = options?.interactive ? `Failed to launch Linux PTY via util-linux script: ${error.message}` : error.message;
+    if (state.mailbox) closeMailbox(state.mailbox);
   });
   child.once("close", (code) => {
+    if (state.mailbox) closeMailbox(state.mailbox);
     outputStream.end(() => {
       state.exitCode = code ?? (state.spawnError ? 1 : 0);
     });
@@ -231,11 +339,12 @@ function readBackgroundOutput(surface: string, lines: number): string {
 }
 
 export function readScreen(surface: string, lines = 50): string {
-  return readBackgroundOutput(surface, lines);
+  const herdr = backgroundSurfaces.get(surface)?.herdr;
+  return herdr ? readHerdrScreen(herdr) : readBackgroundOutput(surface, lines);
 }
 
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
-  return readBackgroundOutput(surface, lines);
+  return readScreen(surface, lines);
 }
 
 export function descendantProcessIds(rootPid: number, processTable: string): number[] {
@@ -258,6 +367,12 @@ export function descendantProcessIds(rootPid: number, processTable: string): num
 export function closeSurface(surface: string): void {
   const state = backgroundSurfaces.get(surface);
   const child = state?.child;
+  if (state?.mailbox) closeMailbox(state.mailbox);
+  if (state?.herdr) {
+    closeHerdrSurface(state.herdr);
+    backgroundSurfaces.delete(surface);
+    return;
+  }
   if (child?.pid && child.exitCode === null) {
     try {
       if (process.platform === "win32") {
@@ -266,10 +381,12 @@ export function closeSurface(surface: string): void {
         // Nested surfaces start their own process groups; killing only the root group leaves them alive.
         const table = execFileSync("ps", ["-eo", "pid=,ppid="], { encoding: "utf8", timeout: 5000 });
         for (const pid of descendantProcessIds(child.pid, table)) {
-          try { process.kill(-pid, "SIGTERM"); } catch (error: any) { if (error.code !== "ESRCH") throw error; }
           try { process.kill(pid, "SIGTERM"); } catch (error: any) { if (error.code !== "ESRCH") throw error; }
+          try { process.kill(pid, "SIGKILL"); } catch (error: any) { if (error.code !== "ESRCH") throw error; }
+          // Let the still-living parent reap each leaf before terminating it.
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
         }
-        try { process.kill(-child.pid, "SIGTERM"); } catch (error: any) {
+        try { process.kill(-child.pid, "SIGKILL"); } catch (error: any) {
           if (error.code !== "ESRCH") throw error;
           child.kill("SIGTERM");
         }
@@ -355,9 +472,18 @@ export async function pollForExit(
         : { reason: "sentinel", exitCode: background.exitCode };
     }
 
+    if (background?.herdr) {
+      try {
+        const metadata = herdrMetadata(background.herdr);
+        if (metadata.state === "finished") return { reason: "done", exitCode: metadata.exitCode ?? 1 };
+      } catch (error) {
+        return { reason: "error", exitCode: 1, errorMessage: error instanceof Error ? error.message : "Herdr status failed" };
+      }
+    }
+
     try {
-      const screen = await readScreenAsync(surface, 5);
-      const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
+      const screen = background?.herdr || background?.mailbox ? "" : await readScreenAsync(surface, 5);
+      const match = background?.mailbox ? null : screen.match(/__SUBAGENT_DONE_(\d+)__/);
       if (match) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
       }

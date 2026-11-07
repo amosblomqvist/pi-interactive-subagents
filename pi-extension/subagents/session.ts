@@ -99,6 +99,9 @@ export interface SubagentLoadout {
   agent: string | null;
   /** The `--tools` allowlist string, or null when the spawn was unrestricted. */
   toolAllowlist: string | null;
+  disableSkills?: boolean;
+  disableExtensions?: boolean;
+  maxTurns?: number;
   /** Model id (without thinking suffix), or null to use the session default. */
   model: string | null;
   /** Thinking level appended to the model as `model:level`, or null. */
@@ -144,7 +147,12 @@ function nullableString(value: unknown): value is string | null {
 function validSubagentLoadout(value: unknown): value is SubagentLoadout {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const input = value as Record<string, unknown>;
-  if (Object.keys(input).length !== LOADOUT_KEYS.length) return false;
+  const optionalKeys = ["disableSkills", "disableExtensions", "maxTurns"];
+  if (Object.keys(input).some(key => !(LOADOUT_KEYS as readonly string[]).includes(key) && !optionalKeys.includes(key))) return false;
+  for (const key of ["disableSkills", "disableExtensions"]) {
+    if (Object.hasOwn(input, key) && typeof input[key] !== "boolean") return false;
+  }
+  if (Object.hasOwn(input, "maxTurns") && (typeof input.maxTurns !== "number" || !Number.isSafeInteger(input.maxTurns) || input.maxTurns <= 0)) return false;
   if (!LOADOUT_KEYS.every((key) => Object.hasOwn(input, key))) return false;
   if (!nullableString(input.agent) || !nullableString(input.toolAllowlist)) return false;
   if (!nullableString(input.model) || !nullableString(input.thinking)) return false;

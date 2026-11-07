@@ -1,3 +1,4 @@
+import "./isolated-home.ts";
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
@@ -1771,7 +1772,7 @@ describe("subagent discovery", () => {
         },
         { artifactDir: d, name: "fork" },
       );
-      assert.deepEqual(parts, []);
+      assert.deepEqual(parts, ["PI_SUBAGENT_MAX_TURNS=''"]);
     });
   });
 
@@ -1796,13 +1797,12 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("buildRpcInput prompts once and queues later messages", () => {
-    assert.equal(
-      testApi.buildRpcInput(["", "/skill:review", "do the task"]),
+  it("buildInteractiveMessages combines skills and task in one bootstrap", () => {
+    assert.deepEqual(
+      testApi.buildInteractiveMessages(["", "/skill:review", "do the task"]),
       [
-        JSON.stringify({ type: "prompt", message: "/skill:review" }),
-        JSON.stringify({ type: "follow_up", message: "do the task" }),
-      ].join("\n"),
+        { message: "do the task", deliverAs: "followUp", skills: ["review"] },
+      ],
     );
   });
 
@@ -2880,34 +2880,34 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("steers a running subagent over RPC (newlines flattened)", () => {
+  it("steers a running subagent preserving newlines", async () => {
     const testApi = (subagentsModule as any).__test__;
     let sentSurface = "";
     let sentText = "";
     const running = makeRunning();
 
-    const result = testApi.steerSubagent(running, "do this\nthen that", (surface: string, text: string) => {
+    const result = await testApi.steerSubagent(running, "do this\nthen that", (surface: string, text: string) => {
       sentSurface = surface;
       sentText = text;
     });
 
     assert.deepEqual(result, { ok: true });
     assert.equal(sentSurface, "process-1");
-    assert.equal(sentText, "do this then that");
+    assert.equal(sentText, "do this\nthen that");
   });
 
-  it("returns an explicit error when steering delivery fails", () => {
+  it("returns an explicit error when steering delivery fails", async () => {
     const testApi = (subagentsModule as any).__test__;
     const running = makeRunning();
 
-    const result = testApi.steerSubagent(running, "hi", () => {
+    const result = await testApi.steerSubagent(running, "hi", async () => {
       throw new Error("transport write failed");
     });
 
     assert.match(result.error, /Failed to deliver message/);
   });
 
-  it("delivers a steer message and forces local status waiting", () => {
+  it("delivers a steer message and forces local status waiting", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     let sentSurface = "";
@@ -2932,7 +2932,7 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning({ statusState: activeState }));
 
-      const result = withMockedNow(20_000, () =>
+      const result = await withMockedNow(20_000, () =>
         testApi.handleSubagentSteer({ name: "Worker", message: "keep going" }, (surface: string, text: string) => {
           sentSurface = surface;
           sentText = text;
@@ -2941,7 +2941,7 @@ describe("subagent interruption", () => {
 
       assert.equal(sentSurface, "process-1");
       assert.equal(sentText, "keep going");
-      assert.equal(result.content[0].text.includes('Message delivered to running subagent "Worker"'), true);
+      assert.equal(result.content[0].text.includes('Message accepted by running subagent "Worker"'), true);
       assert.deepEqual(result.details, { id: "a1", name: "Worker", status: "steered" });
       const snapshot = classifyStatus(runningMap.get("a1").statusState, 20_000);
       assert.equal(snapshot.kind, "waiting");
@@ -2951,20 +2951,20 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("requires a message when steering", () => {
+  it("requires a message when steering", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     runningMap.clear();
     try {
       runningMap.set("a1", makeRunning());
-      const result = testApi.handleSubagentSteer({ name: "Worker", message: "  " }, () => {});
+      const result = await testApi.handleSubagentSteer({ name: "Worker", message: "  " }, () => {});
       assert.match(result.content[0].text, /`message` is required/);
     } finally {
       runningMap.clear();
     }
   });
 
-  it("leaves status unchanged when steering delivery fails in the tool path", () => {
+  it("leaves status unchanged when steering delivery fails in the tool path", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     runningMap.clear();
@@ -2987,8 +2987,8 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning({ statusState: activeState }));
 
-      const result = withMockedNow(20_000, () =>
-        testApi.handleSubagentSteer({ name: "Worker", message: "go" }, () => {
+      const result = await withMockedNow(20_000, () =>
+        testApi.handleSubagentSteer({ name: "Worker", message: "go" }, async () => {
           throw new Error("transport write failed");
         }),
       );

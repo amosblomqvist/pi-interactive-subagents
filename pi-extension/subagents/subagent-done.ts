@@ -12,12 +12,14 @@
  * (auto-exit is suppressed for that turn via `awaitingAnswer`), and the parent
  * replies with subagent_message — which lands as the subagent's next turn.
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { stripFrontmatter, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { writeFileSync } from "node:fs";
+import { writeFileSync, renameSync, readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { createSubagentActivityRecorder } from "./activity.ts";
 import { summarizeToolActivity, sanitizeMonitorText } from "./monitor.ts";
+import { consumeMessages } from "./interactive-ipc.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -121,6 +123,11 @@ export default function (pi: ExtensionAPI) {
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+  const rawMaxTurns = process.env.PI_SUBAGENT_MAX_TURNS;
+  const maxTurns = rawMaxTurns ? Number(rawMaxTurns) : undefined;
+  if (maxTurns !== undefined && (!Number.isSafeInteger(maxTurns) || maxTurns <= 0)) throw new Error("Invalid PI_SUBAGENT_MAX_TURNS");
+  let turns = 0;
+  let turnLimitReached = false;
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
@@ -187,6 +194,8 @@ export default function (pi: ExtensionAPI) {
   let latestAgentMessages: any[] | undefined;
   let shutdownRequested = false;
   let shuttingDown = false;
+  let inputReader: ReturnType<typeof setInterval> | undefined;
+  const mailbox = process.env.PI_SUBAGENT_IPC_DIR;
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
@@ -199,6 +208,42 @@ export default function (pi: ExtensionAPI) {
     denied = parseDeniedTools(deniedToolsValue);
 
     renderWidget(ctx, null);
+    if (inputReader) clearInterval(inputReader);
+    if (mailbox) {
+      if (ctx.mode !== "tui" || !process.stdin.isTTY || !process.stdout.isTTY) {
+        const errorMessage = "Interactive subagent requires Pi TUI on a real PTY";
+        if (process.env.PI_SUBAGENT_SESSION) writeFileSync(`${process.env.PI_SUBAGENT_SESSION}.exit`, JSON.stringify({ type: "error", errorMessage }));
+        ctx.shutdown();
+        throw new Error(errorMessage);
+      }
+      inputReader = setInterval(() => {
+        if (shutdownRequested || shuttingDown) return;
+        try {
+          consumeMessages(mailbox, ({ message, deliverAs, skills }) => {
+            const blocks = (skills ?? []).map(name => {
+              const skill = pi.getCommands().find(command => command.source === "skill" && command.name === `skill:${name}`);
+              if (!skill) throw new Error(`Bootstrap skill is not loaded: ${name}`);
+              const path = skill.sourceInfo.path;
+              return `<skill name="${name}" location="${path}">\nReferences are relative to ${dirname(path)}.\n\n${stripFrontmatter(readFileSync(path, "utf8")).trim()}\n</skill>`;
+            });
+            // One literal prompt prevents async slash expansion from racing the task/auth startup.
+            pi.sendUserMessage([...blocks, message].join("\n\n"), { deliverAs, expandPromptTemplates: false });
+          });
+        } catch (error: any) {
+          clearInterval(inputReader);
+          if (process.env.PI_SUBAGENT_SESSION) writeFileSync(`${process.env.PI_SUBAGENT_SESSION}.exit`, JSON.stringify({ type: "error", errorMessage: `Interactive IPC failed: ${error.message}` }));
+          ctx.shutdown();
+        }
+      }, 40);
+      try {
+        writeFileSync(join(mailbox, "ready.tmp"), JSON.stringify({ mode: "tui" }), { mode: 0o600 });
+        renameSync(join(mailbox, "ready.tmp"), join(mailbox, "ready"));
+      } catch (error) {
+        clearInterval(inputReader);
+        ctx.shutdown();
+        throw error;
+      }
+    }
   });
 
   pi.on("input", () => {
@@ -236,6 +281,15 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_settled", (_event, ctx) => {
     if (shuttingDown || shutdownRequested) return;
+    if (turnLimitReached) {
+      const errorMessage = `Subagent turn limit reached (${maxTurns}); work is incomplete. Resume starts a new bounded process.`;
+      const sessionFile = process.env.PI_SUBAGENT_SESSION;
+      if (sessionFile) writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "error", errorMessage }));
+      recorder.agentEndWaiting("turn limit reached");
+      shutdownRequested = true;
+      ctx.shutdown();
+      return;
+    }
     // Pi emits agent_end before automatic retries, compaction recovery, and
     // queued follow-ups. Publishing terminal state there lets the parent
     // watcher kill the process before those continuations finish.
@@ -306,8 +360,13 @@ export default function (pi: ExtensionAPI) {
     recorder.turnStart((event as any).turnIndex);
   });
 
-  pi.on("turn_end", (event) => {
+  pi.on("turn_end", (event, ctx) => {
     recorder.turnEnd((event as any).turnIndex);
+    turns += 1;
+    if (maxTurns !== undefined && turns >= maxTurns) {
+      turnLimitReached = true;
+      ctx.abort();
+    }
   });
 
   pi.on("before_provider_request", () => {
@@ -352,6 +411,8 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", (event) => {
     shuttingDown = true;
+    if (inputReader) clearInterval(inputReader);
+    inputReader = undefined;
     recorder.sessionShutdown((event as any).reason);
   });
 

@@ -1,3 +1,4 @@
+import "./isolated-home.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -194,6 +195,7 @@ test("runtime config defaults cumulative launches to unlimited and accepts legac
   assert.deepEqual(parseRuntimeConfig({ status: { enabled: true } }), {
     delegation: { maxDepth: 2, maxConcurrentDescendants: 4, maxLaunchesPerLineage: null },
     herdrViewer: { enabled: true },
+    surfaceBackend: "process", includeBundledAgents: true, allowProjectAgents: true, requireProfile: false,
   });
   assert.deepEqual(
     parseRuntimeConfig({ delegation: { maxDepth: 2, maxConcurrentDescendants: 4, maxLaunchesPerLineage: null } }).delegation,
@@ -237,6 +239,7 @@ test("absolute external config is shared by runtime and status without package m
   assert.deepEqual(loadRuntimeConfig(undefined, undefined, env), {
     delegation: { maxDepth: 3, maxConcurrentDescendants: 5, maxLaunchesPerLineage: 20 },
     herdrViewer: { enabled: false },
+    surfaceBackend: "process", includeBundledAgents: true, allowProjectAgents: true, requireProfile: false,
   });
   assert.deepEqual(loadStatusConfig(undefined, undefined, env), { enabled: false, lineLimit: 4 });
   assert.throws(

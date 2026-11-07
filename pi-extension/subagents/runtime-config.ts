@@ -14,6 +14,10 @@ const EXAMPLE_CONFIG_PATH = join(PACKAGE_ROOT, "config.json.example");
 export interface RuntimeConfig {
   delegation: DelegationLimits;
   herdrViewer: { enabled: boolean };
+  surfaceBackend: "process" | "herdr";
+  includeBundledAgents: boolean;
+  allowProjectAgents: boolean;
+  requireProfile: boolean;
 }
 
 export function parseRuntimeConfig(value: unknown, source = "config.json"): RuntimeConfig {
@@ -21,7 +25,7 @@ export function parseRuntimeConfig(value: unknown, source = "config.json"): Runt
     throw new Error(`Invalid subagent runtime config in ${source}: root must be an object`);
   }
   const input = value as Record<string, unknown>;
-  const extra = Object.keys(input).filter((key) => !["status", "delegation", "herdrViewer"].includes(key));
+  const extra = Object.keys(input).filter((key) => !["status", "delegation", "herdrViewer", "surfaceBackend", "includeBundledAgents", "allowProjectAgents", "requireProfile"].includes(key));
   if (extra.length) {
     throw new Error(`Invalid subagent runtime config in ${source}: unsupported key(s): ${extra.join(", ")}`);
   }
@@ -43,8 +47,20 @@ export function parseRuntimeConfig(value: unknown, source = "config.json"): Runt
   if (viewerObject.enabled != null && typeof viewerObject.enabled !== "boolean") {
     throw new Error(`Invalid subagent runtime config in ${source}: herdrViewer.enabled must be a boolean`);
   }
+  for (const key of ["includeBundledAgents", "allowProjectAgents", "requireProfile"]) {
+    if (Object.hasOwn(input, key) && typeof input[key] !== "boolean") {
+      throw new Error(`Invalid subagent runtime config in ${source}: ${key} must be a boolean`);
+    }
+  }
+  if (Object.hasOwn(input, "surfaceBackend") && input.surfaceBackend !== "process" && input.surfaceBackend !== "herdr") {
+    throw new Error(`Invalid subagent runtime config in ${source}: surfaceBackend must be process or herdr`);
+  }
   return {
     delegation,
+    surfaceBackend: input.surfaceBackend === "herdr" ? "herdr" : "process",
+    includeBundledAgents: input.includeBundledAgents !== false,
+    allowProjectAgents: input.allowProjectAgents !== false,
+    requireProfile: input.requireProfile === true,
     herdrViewer: { enabled: viewerObject.enabled !== false },
   };
 }

@@ -248,7 +248,7 @@ export function cleanupTestEnv(env: TestEnv, operations: CleanupOperations = {})
 
 /** Create a surface and register it for automatic cleanup. */
 export function createTrackedSurface(env: TestEnv, name: string): string {
-  const surface = createSurface(name);
+  const surface = createSurface(name, { surfaceBackend: "process" });
   env.surfaces.push(surface);
   return surface;
 }

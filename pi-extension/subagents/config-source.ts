@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, resolve, join } from "node:path";
+import { homedir } from "node:os";
 
 export interface ConfigSource {
   sourcePath: string;
@@ -32,6 +33,12 @@ export function readSubagentsConfigSource(options: {
         const detail = error instanceof Error ? error.message : String(error);
         throw new Error(`Cannot read PI_SUBAGENTS_CONFIG ${sourcePath}: ${detail}`);
       }
+    }
+    const personal = join(env.PI_CODING_AGENT_DIR || join(env.HOME || homedir(), ".pi", "agent"), "subagents.json");
+    try {
+      return { sourcePath: personal, rawConfig: readFileSync(personal, "utf8") };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
   }
 
