@@ -1,3 +1,4 @@
+import './isolated-home.ts';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -41,7 +42,7 @@ async function withIsolatedSubagentEnvironment(run) {
 const cases = [
   {
     file: 'pi-extension/subagents/index.ts',
-    tools: ['implementation_route', 'subagent', 'subagent_message', 'subagents_list', 'subagent_cancel'],
+    tools: ['implementation_route', 'subagent', 'subagent_message', 'subagents_list', 'subagent_cancel', 'subagent_status'],
   },
   {
     file: 'pi-extension/subagents/subagent-done.ts',
